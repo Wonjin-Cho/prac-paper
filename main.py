@@ -104,7 +104,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--FT",
-    default="BP",
+    default="",
     type=str,
     help="method for finetuning",
     choices=["", "BP", "MiR"],
@@ -180,9 +180,9 @@ def main():
     # python main.py --num_sample 500 --seed 2021 --epoch 100 --practise one --rm_blocks layer1.1 --gpu_id 0
     args.num_sample = 1280
     args.seed = 2021
-    args.epoch = 1500  # Increased for curriculum learning
+    args.epoch = 2500  # Increased for noisy synthetic data
     args.state_dict_path = ""
-    args.lr = 0.02  # Adjusted for curriculum
+    args.lr = 0.01  # Reduced LR for synthetic data (was 0.02)
     args.practise = "all"
     args.rm_blocks = "1"
     args.gpu_id = "0"

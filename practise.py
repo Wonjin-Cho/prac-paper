@@ -814,16 +814,6 @@ def Practise_one_block(
     score = 0
     # print(f"{rm_block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
     device = "cuda"
-    DD = DistillData(args)
-    dataloader = DD.get_distil_data(
-        model_name=args.model,
-        teacher_model=origin_model.cuda(),
-        batch_size=args.batch_size,
-        group=args.group,
-        beta=0.1,
-        gamma=0.5,
-        save_path_head=args.save_path_head,
-    )
     return pruned_model, (recoverability, lat_reduction, score)
 
 
@@ -1243,14 +1233,16 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
 
     recover_time = time.time()
     
-    # Phase 1: Train adaptors only (first 40% of epochs)
-    phase1_epochs = int(0.4 * args.epoch)
-    print(f"Phase 1: Training adaptors only for {phase1_epochs} epochs")
+    # For synthetic data: Longer phase 1 to learn robust features, shorter phase 2
+    # Phase 1: Train adaptors only (first 50% of epochs for synthetic data)
+    phase1_epochs = int(0.5 * args.epoch)  # Increased from 0.4
+    print(f"Phase 1: Training adaptors only for {phase1_epochs} epochs (synthetic data mode)")
+    print("Using noise-robust Huber loss and quality-weighted feature matching")
     train_progressive(train_loader, optimizer, prune_model, origin_model, args, 
                      scheduler, warmup_epochs, phase1_epochs, phase=1, rm_blocks=rm_blocks)
     
-    # Phase 2: Progressive unfreezing (remaining 60% of epochs)
-    print(f"Phase 2: Progressive unfreezing with BN adaptation")
+    # Phase 2: Progressive unfreezing (remaining 50% of epochs)
+    print(f"Phase 2: Progressive unfreezing with BN adaptation (synthetic data mode)")
     unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer)
     train_progressive(train_loader, optimizer, prune_model, origin_model, args, 
                      scheduler, warmup_epochs, args.epoch - phase1_epochs, 
@@ -1335,9 +1327,15 @@ def spatial_attention_loss(student_feat, teacher_feat):
 def train_progressive(train_loader, optimizer, model, origin_model, args, 
                      scheduler=None, warmup_epochs=0, max_epochs=None, 
                      phase=1, rm_blocks=None, start_epoch=0):
-    """Progressive training with multi-scale feature matching"""
+    """Progressive training with multi-scale feature matching, adapted for noisy synthetic data"""
     end = time.time()
-    criterion = torch.nn.MSELoss(reduction="mean")
+    # Use Huber loss instead of MSE for robustness to outliers in synthetic data
+    criterion = torch.nn.HuberLoss(reduction="mean", delta=1.0)
+    
+    # Early stopping for synthetic data (prevent overfitting)
+    best_loss = float('inf')
+    patience_counter = 0
+    patience_limit = 100  # Stop if no improvement for 100 iterations
     
     # Multi-scale feature extraction hooks
     teacher_features_multi = {}
@@ -1391,8 +1389,15 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
                 data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6)
             
             # Apply mixup augmentation (only in phase 2 for stability)
-            if phase == 2 and np.random.rand() < 0.5:
-                data, _, _, _ = mixup_data(data, target, alpha=0.4)
+            # For synthetic data, use stronger augmentation to prevent overfitting
+            if phase == 2 and np.random.rand() < 0.7:  # Increased from 0.5
+                data, _, _, _ = mixup_data(data, target, alpha=0.3)  # Reduced alpha for more mixing
+            
+            # Add slight Gaussian noise to synthetic images for regularization
+            if np.random.rand() < 0.3:
+                noise = torch.randn_like(data) * 0.02
+                data = data + noise
+                data = torch.clamp(data, -3, 3)  # Clamp to reasonable range
             
             with torch.no_grad():
                 t_output, t_features = origin_model(data)
@@ -1409,10 +1414,18 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
                 continue
             
             # Main feature loss with spatial attention and statistics matching
+            # For synthetic data, reduce attention loss weight (it's more sensitive to noise)
             attention_loss = spatial_attention_loss(s_features, t_features)
-            mse_loss = criterion(s_features, t_features)
+            huber_loss = criterion(s_features, t_features)
             stats_loss = feature_statistics_loss(s_features, t_features)
-            loss = 0.5 * mse_loss + 0.3 * attention_loss + 0.2 * stats_loss
+            
+            # Compute feature quality score (lower variance = higher quality)
+            with torch.no_grad():
+                feature_std = torch.std(s_features, dim=[2, 3]).mean()
+                quality_weight = torch.clamp(1.0 / (1.0 + feature_std), 0.5, 1.0)
+            
+            # Weighted loss: reduce attention weight for noisy synthetic data
+            loss = 0.6 * huber_loss + 0.2 * attention_loss * quality_weight + 0.2 * stats_loss
             
             # Multi-scale feature matching in Phase 2
             if phase == 2 and teacher_features_multi and student_features_multi:
@@ -1443,6 +1456,20 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
             
             loss = loss / accumulation_steps
             losses.update(loss.data.item() * accumulation_steps, data.size(0))
+            
+            # Early stopping check for synthetic data
+            current_loss = losses.avg
+            if current_loss < best_loss:
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience_limit:
+                print(f"\nEarly stopping at iteration {iter_nums}: no improvement for {patience_limit} iterations")
+                print(f"Best loss: {best_loss:.4f}, Current loss: {current_loss:.4f}")
+                finish = True
+                break
             
             try:
                 loss.backward()

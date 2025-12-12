@@ -1206,6 +1206,19 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
             origin_model, prune_model, rm_blocks, params, args
         )
 
+    # Enhanced initialization: Initialize adaptors with small random perturbations
+    for param_dict in params:
+        for param in param_dict['params']:
+            if len(param.shape) == 4:  # Conv layer
+                # Small perturbation around identity
+                nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+                param.data *= 0.1  # Scale down to stay close to identity
+                
+                # Add identity component
+                if param.shape[0] == param.shape[1]:
+                    eye = torch.eye(param.shape[0]).view(param.shape[0], param.shape[1], 1, 1)
+                    param.data += eye.to(param.device)
+
     if args.opt == "SGD":
         optimizer = torch.optim.SGD(
             params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
@@ -1226,7 +1239,20 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     )
 
     recover_time = time.time()
-    train(train_loader, optimizer, prune_model, origin_model, args, scheduler, warmup_epochs)
+    
+    # Phase 1: Train adaptors only (first 40% of epochs)
+    phase1_epochs = int(0.4 * args.epoch)
+    print(f"Phase 1: Training adaptors only for {phase1_epochs} epochs")
+    train_progressive(train_loader, optimizer, prune_model, origin_model, args, 
+                     scheduler, warmup_epochs, phase1_epochs, phase=1, rm_blocks=rm_blocks)
+    
+    # Phase 2: Progressive unfreezing (remaining 60% of epochs)
+    print(f"Phase 2: Progressive unfreezing with BN adaptation")
+    unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer)
+    train_progressive(train_loader, optimizer, prune_model, origin_model, args, 
+                     scheduler, warmup_epochs, args.epoch - phase1_epochs, 
+                     phase=2, rm_blocks=rm_blocks, start_epoch=phase1_epochs)
+    
     print(
         "compute recoverability {} takes {}s".format(
             rm_blocks, time.time() - recover_time
@@ -1234,110 +1260,189 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     )
 
 
-def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
-    # Data loading code
+def unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer):
+    """Unfreeze BatchNorm layers near removed blocks for better adaptation"""
+    model = prune_model.model if hasattr(prune_model, 'model') else prune_model
+    
+    # Get layers to unfreeze
+    layers_to_unfreeze = set()
+    for rm_block in rm_blocks:
+        parts = rm_block.split('.')
+        if len(parts) >= 2:
+            layer_name = parts[0]  # e.g., 'layer1'
+            layers_to_unfreeze.add(layer_name)
+    
+    # Unfreeze BN parameters in those layers
+    bn_params = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            for layer in layers_to_unfreeze:
+                if name.startswith(layer):
+                    module.weight.requires_grad = True
+                    module.bias.requires_grad = True
+                    bn_params.extend([module.weight, module.bias])
+                    print(f"Unfroze BN layer: {name}")
+                    break
+    
+    # Add BN parameters to optimizer
+    if bn_params:
+        optimizer.add_param_group({'params': bn_params, 'lr': optimizer.param_groups[0]['lr'] * 0.1})
+        print(f"Added {len(bn_params)} BN parameters to optimizer")
+
+
+def train_progressive(train_loader, optimizer, model, origin_model, args, 
+                     scheduler=None, warmup_epochs=0, max_epochs=None, 
+                     phase=1, rm_blocks=None, start_epoch=0):
+    """Progressive training with multi-scale feature matching"""
     end = time.time()
     criterion = torch.nn.MSELoss(reduction="mean")
-
-    # switch to train mode
-    origin_model.cuda()
-    origin_model.eval()
-    model.cuda()
-    model.eval()
+    
+    # Multi-scale feature extraction hooks
+    teacher_features_multi = {}
+    student_features_multi = {}
+    
+    def get_activation(name, features_dict):
+        def hook(module, input, output):
+            features_dict[name] = output
+        return hook
+    
+    # Register hooks for multi-scale features
+    origin_model.cuda().eval()
+    model.cuda().eval()
+    
+    # Hook intermediate layers for multi-scale matching
+    if phase == 2:  # Only in phase 2
+        for name, module in origin_model.named_modules():
+            if 'layer' in name and len(name.split('.')) == 1:  # layer1, layer2, etc.
+                module.register_forward_hook(get_activation(name, teacher_features_multi))
+        
+        for name, module in model.model.named_modules() if hasattr(model, 'model') else model.named_modules():
+            if 'layer' in name and len(name.split('.')) == 1:
+                module.register_forward_hook(get_activation(name, student_features_multi))
+    
     model.get_feat = "pre_GAP"
     origin_model.get_feat = "pre_GAP"
-
-    # Gradient accumulation
+    
     accumulation_steps = 2
-
     torch.cuda.empty_cache()
-    iter_nums = 0
+    iter_nums = start_epoch
+    max_iters = max_epochs if max_epochs else args.epoch
     finish = False
+    
     while not finish:
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
+        
         for batch_idx, (data, target) in enumerate(train_loader):
             iter_nums += 1
-            if iter_nums > args.epoch:
+            if iter_nums > start_epoch + max_iters:
                 finish = True
                 break
-            # measure data loading time
+            
             data_time.update(time.time() - end)
-            # sanitize inputs
+            
             if isinstance(data, torch.Tensor):
                 data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
             else:
                 data = safe_to_device(data)
                 data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6)
-
+            
             with torch.no_grad():
                 t_output, t_features = origin_model(data)
-
-            # check teacher features
+            
             if not assert_finite("t_features", t_features):
                 print("Skipping batch due to non-finite teacher features")
                 continue
-
+            
             optimizer.zero_grad()
             output, s_features = model(data)
-
-            # check student features
+            
             if not assert_finite("s_features", s_features):
                 print("Skipping batch due to non-finite student features")
                 continue
-
+            
+            # Main feature loss
             loss = criterion(s_features, t_features)
+            
+            # Multi-scale feature matching in Phase 2
+            if phase == 2 and teacher_features_multi and student_features_multi:
+                multi_scale_loss = 0.0
+                scale_count = 0
+                for layer_name in teacher_features_multi:
+                    if layer_name in student_features_multi:
+                        t_feat = teacher_features_multi[layer_name]
+                        s_feat = student_features_multi[layer_name]
+                        
+                        # Spatial pooling to match dimensions if needed
+                        if t_feat.shape != s_feat.shape:
+                            pool_size = t_feat.shape[2] // s_feat.shape[2] if t_feat.shape[2] > s_feat.shape[2] else 1
+                            if pool_size > 1:
+                                t_feat = F.adaptive_avg_pool2d(t_feat, s_feat.shape[2:])
+                        
+                        multi_scale_loss += criterion(s_feat, t_feat)
+                        scale_count += 1
+                
+                if scale_count > 0:
+                    multi_scale_loss /= scale_count
+                    # Weighted combination: more emphasis on final features
+                    loss = 0.7 * loss + 0.3 * multi_scale_loss
+            
             if not assert_finite("loss", loss):
                 print("Skipping batch due to non-finite loss")
                 continue
-
-            # Normalize loss by accumulation steps
+            
             loss = loss / accumulation_steps
             losses.update(loss.data.item() * accumulation_steps, data.size(0))
-
+            
             try:
                 loss.backward()
                 
-                # Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    # gradient clipping
                     torch.nn.utils.clip_grad_norm_(
                         filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
                     )
                     optimizer.step()
                     optimizer.zero_grad()
                     
-                    # Learning rate warmup and scheduling
-                    if warmup_epochs > 0 and iter_nums <= warmup_epochs:
-                        lr = args.lr * (iter_nums / warmup_epochs)
+                    # Learning rate scheduling
+                    if warmup_epochs > 0 and iter_nums <= warmup_epochs + start_epoch:
+                        lr = args.lr * ((iter_nums - start_epoch) / warmup_epochs)
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr
-                    elif scheduler is not None and iter_nums > warmup_epochs:
+                    elif scheduler is not None and iter_nums > warmup_epochs + start_epoch:
                         scheduler.step()
             except Exception as e:
                 print("Backward/step failed:", e)
                 torch.cuda.empty_cache()
                 continue
-            # measure elapsed time
+            
             batch_time.update(time.time() - end)
             end = time.time()
+            
             if iter_nums % 50 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(
-                    "Train: [{0}/{1}]\t"
+                    "Phase {5} Train: [{0}/{1}]\t"
                     "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                     "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
                     "Loss {losses.val:.4f} ({losses.avg:.4f})\t"
                     "LR {lr:.6f}".format(
-                        iter_nums,
-                        args.epoch,
+                        iter_nums - start_epoch,
+                        max_iters,
                         batch_time=batch_time,
                         data_time=data_time,
                         losses=losses,
                         lr=current_lr,
+                        phase=phase
                     )
                 )
+
+
+def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
+    """Wrapper for backward compatibility"""
+    train_progressive(train_loader, optimizer, model, origin_model, args, 
+                     scheduler, warmup_epochs, max_epochs=args.epoch, phase=1, rm_blocks=[])
 
 
 # def Practise_recover(

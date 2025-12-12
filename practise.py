@@ -1,3 +1,53 @@
+
+import os
+import gc
+import argparse
+import logging
+import collections
+from datetime import datetime
+import time
+
+# from xml.parsers.expat import model
+import numpy as np
+import torch
+import torch.nn as nn
+import copy
+import pickle
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import seaborn as sns
+# torch.manual_seed(487)
+
+from models import *
+import dataset
+from models.resnet import BasicBlock, Bottleneck
+from loops_mixstd import train_distill
+
+from finetune import AverageMeter, validate, accuracy
+from compute_flops import compute_MACs_params
+from models.AdaptorWarp import AdaptorWarp
+from models.BlockReinitWarp import BlockReinitWarp
+from past_src.Grasp import GraSP, compute_importance_resnet
+from models.resnet import load_rm_block_state_dict
+from past_src.distill_data import DistillData
+from past_src.generate_data import arg_parse
+
+
+class ModelEMA:
+    """Exponential Moving Average for model parameters"""
+    def __init__(self, model, decay=0.9999):
+        self.module = copy.deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+        
+    def update(self, model):
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.module.parameters(), model.parameters()):
+                ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1 - self.decay)
+                
+    def state_dict(self):
+        return self.module.state_dict()
+
 import os
 import gc
 import argparse
@@ -1080,8 +1130,67 @@ def insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks, params,
         rm_count[l_id - 1] += 1
         rm_block_prune = f"{layer}.{prune_b_id}"
         rm_blocks_for_prune.append(rm_block_prune)
+    
+    # Add layer-wise learning rates for adaptors
     for rm_block in rm_blocks_for_prune:
-        insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args)
+        layer_num = int(rm_block.split('.')[0][-1])
+        # Higher LR for layers closer to pruned block
+        lr_multiplier = 2.0 if layer_num <= 2 else 1.0
+        insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args, lr_multiplier)
+
+def insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args, lr_multiplier=1.0):
+    pruned_named_modules = dict(prune_model.model.named_modules())
+    if "layer1.0.conv2" in pruned_named_modules:
+        last_conv_in_block = "conv2"
+    elif "layer1.0.conv3" in pruned_named_modules:
+        last_conv_in_block = "conv3"
+    else:
+        raise ValueError("This is not a ResNet.")
+
+    print("-" * 50)
+    print("=> {} (LR multiplier: {:.1f})".format(rm_block, lr_multiplier))
+    layer = ""
+    block = ""
+    if len(rm_block.split(".")) == 3:
+        layer, block, _ = rm_block.split(".")
+    else:
+        layer, block = rm_block.split(".")
+    rm_block_id = int(block)
+    assert rm_block_id >= 1
+
+    downsample = "{}.0.downsample.0".format(layer)
+    if downsample in pruned_named_modules:
+        conv = prune_model.add_afterconv_for_conv(downsample)
+        if conv is not None:
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
+
+    for origin_block_num in range(rm_block_id):
+        last_conv_key = "{}.{}.{}".format(layer, origin_block_num, last_conv_in_block)
+        conv = prune_model.add_afterconv_for_conv(last_conv_key)
+        if conv is not None:
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
+
+    for origin_block_num in range(rm_block_id + 1, 100):
+        pruned_output_key = "{}.{}.conv1".format(layer, origin_block_num - 1)
+        if pruned_output_key not in pruned_named_modules:
+            break
+        conv = prune_model.add_preconv_for_conv(pruned_output_key)
+        if conv is not None:
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
+
+    # next stage's conv1
+    next_layer_conv1 = "layer{}.0.conv1".format(int(layer[-1]) + 1)
+    if next_layer_conv1 in pruned_named_modules:
+        conv = prune_model.add_preconv_for_conv(next_layer_conv1)
+        if conv is not None:
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
+
+    # next stage's downsample
+    next_layer_downsample = "layer{}.0.downsample.0".format(int(layer[-1]) + 1)
+    if next_layer_downsample in pruned_named_modules:
+        conv = prune_model.add_preconv_for_conv(next_layer_downsample)
+        if conv is not None:
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
 
 def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
@@ -1320,17 +1429,22 @@ def train_clkd(
     # Adaptive loss weights with warmup
     warmup_epochs = int(0.1 * args.epoch)
     
+    # Temperature for knowledge distillation
+    temperature = 4.0
+    
     def get_loss_weights(current_iter):
         if current_iter < warmup_epochs:
             alpha = current_iter / warmup_epochs
-            lambda_ce = 0.3 + 0.2 * alpha
-            mu_nmse = 0.3 + 0.3 * alpha
+            lambda_ce = 0.2 + 0.1 * alpha
+            lambda_kd = 0.3 + 0.2 * alpha
+            mu_nmse = 0.3 + 0.2 * alpha
             nu_cc = 0.05 + 0.15 * alpha
         else:
-            lambda_ce = 0.3
-            mu_nmse = 0.6
+            lambda_ce = 0.2
+            lambda_kd = 0.5
+            mu_nmse = 0.4
             nu_cc = 0.2
-        return lambda_ce, mu_nmse, nu_cc
+        return lambda_ce, lambda_kd, mu_nmse, nu_cc
 
     # Extract features from pre-GAP layer
     model.get_feat = "pre_GAP"
@@ -1385,6 +1499,15 @@ def train_clkd(
                 print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
                 continue
 
+            # Soft target KD loss with temperature scaling
+            t_soft = F.softmax(t_logits / temperature, dim=1)
+            s_soft = F.log_softmax(s_logits / temperature, dim=1)
+            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
+            
+            if not assert_finite("kd_soft_loss", kd_soft_loss):
+                print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
+                continue
+
             l_ins = nmse_loss(s_features, t_features)
             if problematic_classes is None:
                 l_cla = nmse_loss(s_features.T, t_features.T)
@@ -1397,10 +1520,10 @@ def train_clkd(
                 )
 
             # Get adaptive loss weights
-            lambda_ce, mu_nmse, nu_cc = get_loss_weights(iter_nums)
+            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
             
-            kd_loss = l_ins + l_cla
-            total_loss = lambda_ce * ce_loss + mu_nmse * kd_loss + nu_cc * cc_loss
+            kd_feature_loss = l_ins + l_cla
+            total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
 
             if not assert_finite("total_loss", total_loss):
                 print(f"[batch {iter_nums}] skipping: total_loss non-finite")

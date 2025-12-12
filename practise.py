@@ -1205,6 +1205,9 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
         insert_all_adaptors_for_resnet(
             origin_model, prune_model, rm_blocks, params, args
         )
+    
+    # Create EMA model for self-distillation
+    ema_model = ModelEMA(prune_model, decay=0.9996)
 
     # Enhanced initialization: Initialize adaptors with small random perturbations
     for param_dict in params:
@@ -1290,6 +1293,45 @@ def unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer):
         print(f"Added {len(bn_params)} BN parameters to optimizer")
 
 
+def mixup_data(x, y, alpha=0.4):
+    """Apply mixup augmentation"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).cuda()
+    
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def feature_statistics_loss(student_feat, teacher_feat):
+    """Match channel-wise mean and variance"""
+    # Compute per-channel statistics
+    s_mean = student_feat.mean(dim=[0, 2, 3])
+    t_mean = teacher_feat.mean(dim=[0, 2, 3])
+    
+    s_var = student_feat.var(dim=[0, 2, 3])
+    t_var = teacher_feat.var(dim=[0, 2, 3])
+    
+    mean_loss = F.mse_loss(s_mean, t_mean)
+    var_loss = F.mse_loss(s_var, t_var)
+    
+    return mean_loss + var_loss
+
+def spatial_attention_loss(student_feat, teacher_feat):
+    """Compute attention-weighted feature matching loss"""
+    # Compute spatial attention maps from teacher
+    B, C, H, W = teacher_feat.shape
+    teacher_attention = torch.mean(teacher_feat, dim=1, keepdim=True)  # [B, 1, H, W]
+    teacher_attention = F.softmax(teacher_attention.view(B, -1), dim=1).view(B, 1, H, W)
+    
+    # Weight the feature difference by attention
+    weighted_diff = teacher_attention * (student_feat - teacher_feat) ** 2
+    return weighted_diff.mean()
+
 def train_progressive(train_loader, optimizer, model, origin_model, args, 
                      scheduler=None, warmup_epochs=0, max_epochs=None, 
                      phase=1, rm_blocks=None, start_epoch=0):
@@ -1348,6 +1390,10 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
                 data = safe_to_device(data)
                 data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6)
             
+            # Apply mixup augmentation (only in phase 2 for stability)
+            if phase == 2 and np.random.rand() < 0.5:
+                data, _, _, _ = mixup_data(data, target, alpha=0.4)
+            
             with torch.no_grad():
                 t_output, t_features = origin_model(data)
             
@@ -1362,8 +1408,11 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
                 print("Skipping batch due to non-finite student features")
                 continue
             
-            # Main feature loss
-            loss = criterion(s_features, t_features)
+            # Main feature loss with spatial attention and statistics matching
+            attention_loss = spatial_attention_loss(s_features, t_features)
+            mse_loss = criterion(s_features, t_features)
+            stats_loss = feature_statistics_loss(s_features, t_features)
+            loss = 0.5 * mse_loss + 0.3 * attention_loss + 0.2 * stats_loss
             
             # Multi-scale feature matching in Phase 2
             if phase == 2 and teacher_features_multi and student_features_multi:
@@ -1404,6 +1453,10 @@ def train_progressive(train_loader, optimizer, model, origin_model, args,
                     )
                     optimizer.step()
                     optimizer.zero_grad()
+                    
+                    # Update EMA model (if available in parent scope)
+                    if 'ema_model' in dir():
+                        ema_model.update(model)
                     
                     # Learning rate scheduling
                     if warmup_epochs > 0 and iter_nums <= warmup_epochs + start_epoch:

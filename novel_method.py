@@ -66,7 +66,7 @@ class SlicedWassersteinLoss(nn.Module):
 
 class AdaptiveUncertaintyMixup:
     """Mixup with curriculum-based uncertainty weighting"""
-     def __init__(self, teacher_model, alpha=1.0, num_classes=1000):
+    def __init__(self, teacher_model, alpha=1.0, num_classes=1000):
         self.teacher_model = teacher_model
         self.alpha = alpha
         self.uncertainty_ema = None

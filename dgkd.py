@@ -303,13 +303,19 @@ class DGKDLoss(nn.Module):
             0.3 * consistency_loss      # Self-supervised consistency
         )
 
+        # Helper function to safely get item from tensor or float
+        def safe_item(x):
+            if isinstance(x, torch.Tensor):
+                return x.item()
+            return float(x)
+
         return {
             'total': total_loss,
-            'cls_loss': cls_loss.item(),
-            'kd_loss': kd_loss.item() if isinstance(kd_loss, torch.Tensor) else kd_loss,
-            'graph_loss': graph_loss.item() if isinstance(graph_loss, torch.Tensor) else graph_loss,
-            'mg_loss': mg_total.item() if isinstance(mg_total, torch.Tensor) else mg_total,
-            'consistency_loss': consistency_loss.item() if isinstance(consistency_loss, torch.Tensor) else consistency_loss,
+            'cls_loss': safe_item(cls_loss),
+            'kd_loss': safe_item(kd_loss),
+            'graph_loss': safe_item(graph_loss),
+            'mg_loss': safe_item(mg_total),
+            'consistency_loss': safe_item(consistency_loss),
             'temperature': temperature
         }
 

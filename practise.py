@@ -30,6 +30,7 @@ from past_src.Grasp import GraSP, compute_importance_resnet
 from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
+from novel_method import MSFAMTrainer, train_with_msfam
 
 
 class ModelEMA:
@@ -79,6 +80,7 @@ from past_src.Grasp import GraSP, compute_importance_resnet
 from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
+from novel_method import MSFAMTrainer, train_with_msfam
 
 
 def assert_finite(name, tensor):
@@ -813,16 +815,7 @@ def Practise_one_block(
     score = 0
     # print(f"{rm_block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
     device = "cuda"
-    DD = DistillData(args)
-    dataloader = DD.get_distil_data(
-        model_name=args.model,
-        teacher_model=origin_model.cuda(),
-        batch_size=args.batch_size,
-        group=args.group,
-        beta=0.1,
-        gamma=0.5,
-        save_path_head=args.save_path_head,
-    )
+    
     return pruned_model, (recoverability, lat_reduction, score)
 
 
@@ -1645,7 +1638,7 @@ def metric(metric_loader, model, origin_model, trained=False):
                 )
             )
 
-    print(" * Metric Loss {loss.avg:.4f}".format(loss=losses))
+    print(" * Metric Loss {loss.avg:.4f}")
 
     problematic_classes = []
     print(

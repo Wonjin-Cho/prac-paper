@@ -93,9 +93,29 @@ class MSPRTrainer:
         if hasattr(self.student, 'model'):
             # Student is wrapped in AdaptorWarp, get the base model
             base_model = self.student.model
+            
+            # Create a clean state dict without any hooks
+            state_dict = base_model.state_dict()
+            
+            # Create a new model instance with the same architecture
+            # by creating a new instance from scratch
             ema_model = copy.deepcopy(base_model)
+            
+            # Remove all hooks from the new model
+            for module in ema_model.modules():
+                module._forward_hooks.clear()
+                module._forward_pre_hooks.clear()
+                module._backward_hooks.clear()
+            
+            # Load the clean state dict
+            ema_model.load_state_dict(state_dict)
         else:
             ema_model = copy.deepcopy(self.student)
+            # Remove all hooks
+            for module in ema_model.modules():
+                module._forward_hooks.clear()
+                module._forward_pre_hooks.clear()
+                module._backward_hooks.clear()
         
         for param in ema_model.parameters():
             param.requires_grad = False

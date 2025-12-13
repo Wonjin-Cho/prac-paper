@@ -31,6 +31,9 @@ from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
 from novel_method import MSFAMTrainer, train_with_msfam
+from novel_method_mmd import MMDKDTrainer
+from novel_method_attention import AttentionKDTrainer
+from novel_method_contrastive import ContrastiveKDTrainer
 
 
 class ModelEMA:
@@ -81,6 +84,9 @@ from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
 from novel_method import MSFAMTrainer, train_with_msfam
+from novel_method_mmd import MMDKDTrainer
+from novel_method_attention import AttentionKDTrainer
+from novel_method_contrastive import ContrastiveKDTrainer
 
 
 def assert_finite(name, tensor):
@@ -815,7 +821,7 @@ def Practise_one_block(
     score = 0
     # print(f"{rm_block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
     device = "cuda"
-    
+
     return pruned_model, (recoverability, lat_reduction, score)
 
 

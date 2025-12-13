@@ -111,7 +111,7 @@ class AdaptiveUncertaintyMixup:
         
         # Convert hard labels to soft labels if needed
         if len(labels.shape) == 1:
-            
+            num_classes = 1000
             mixed_labels = torch.zeros(batch_size, num_classes, device=labels.device)
             
             for i in range(batch_size):
@@ -343,7 +343,7 @@ class MSFAMTrainer:
         self.ce_loss = nn.CrossEntropyLoss()
         
         # Adaptive mixup
-        self.mixup = AdaptiveUncertaintyMixup(self.teacher, num_classes=num_classes)
+        self.mixup = AdaptiveUncertaintyMixup(self.teacher, num_classes=self.num_classes)
         
         # Momentum contrastive head
         self.contrastive_head = MomentumContrastiveHead(

@@ -358,17 +358,7 @@ def main():
             args,
             len(rm_blocks),
         )
-        # rm_blocks = ["layer3.3"]  # , 'layer2.1']
-        # rm_blocks = ['layer2.1']#, 'layer2.2', 'layer3.2', 'layer3.3'] # 'layer1.2', 'layer2.2',
-        pruned_model1, _ = Practise_one_block(
-            rm_blocks,
-            pruned_model,
-            origin_lat,
-            train_loader,
-            metric_loader,
-            args,
-            len(rm_blocks),
-        )
+        
 
     else:
         pruned_model, _, pruned_lat = build_student(

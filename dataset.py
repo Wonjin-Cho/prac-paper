@@ -16,8 +16,8 @@ if 'Pascal' in hostname:
   ADI_path = '/opt/Dataset/ADI'
   CUB_path = '/opt/Dataset/cub200/raw'
   place365_path = '/opt/Dataset/place365'
-imagenet_path = 'D:\\ImageNet\\ILSVRC2012_img_train'
-imagenet_val_path = 'D:\\ImageNet\\ILSVRC2012_img_train\\val'
+imagenet_path = '/home/mjatwk/data/imagenet/'
+imagenet_val_path = '/home/mjatwk/data/imagenet/val/'
 
 def pil_loader(path):
     path = path.replace('\\', '/')
@@ -282,4 +282,5 @@ def fakedata(num_sample=400, sub_idx=None, batch_size=64):
 
 if __name__ == '__main__':
     import IPython
+
     IPython.embed()

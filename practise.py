@@ -1212,7 +1212,46 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
 
     # Select training method based on args
     if hasattr(args, 'training_method'):
-        if args.training_method == 'combined':
+        if args.training_method == 'alkd':
+            print("Using ALKD-CR method (Adaptive Layer-wise KD with Channel Recalibration)")
+            from novel_method_alkd import ALKDCRTrainer
+            trainer = ALKDCRTrainer(prune_model, origin_model, rm_blocks)
+            
+            # Add feature aligner parameters to optimizer
+            all_params = trainer.get_trainable_parameters()
+            if args.opt == "SGD":
+                optimizer = torch.optim.SGD(
+                    all_params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+                )
+            elif args.opt == "Adam":
+                optimizer = torch.optim.Adam(all_params, lr=args.lr, weight_decay=args.weight_decay)
+            elif args.opt == "AdamW":
+                optimizer = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
+            
+            # Training loop
+            iter_nums = 0
+            finish = False
+            while not finish:
+                for batch_idx, (data, target) in enumerate(train_loader):
+                    iter_nums += 1
+                    if iter_nums > args.epoch:
+                        finish = True
+                        break
+                    
+                    losses = trainer.train_step(data, target, optimizer, iter_nums, args.epoch)
+                    
+                    # Clear cache to reduce memory usage
+                    if iter_nums % 10 == 0:
+                        torch.cuda.empty_cache()
+                    
+                    if iter_nums % 50 == 0:
+                        print(f"Train: [{iter_nums}/{args.epoch}]\t"
+                              f"Total Loss {losses['total_loss']:.4f}\t"
+                              f"KD Loss {losses['kd_loss']:.4f}\t"
+                              f"CE Loss {losses['ce_loss']:.4f}\t"
+                              f"Feature Loss {losses['feature_loss']:.4f}\t"
+                              f"Avg Difficulty {losses['avg_difficulty']:.4f}")
+        elif args.training_method == 'combined':
             print("Using Combined KD method (MMD + Relation + Attention + Contrastive)")
             from novel_method_combined import CombinedKDTrainer
             trainer = CombinedKDTrainer(prune_model, origin_model)

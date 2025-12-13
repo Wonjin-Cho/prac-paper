@@ -518,7 +518,6 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     
                     losses = trainer.train_step(data, target, optimizer)
                     
-                    # Clear cache to reduce memory usage
                     if iter_nums % 10 == 0:
                         torch.cuda.empty_cache()
                     

@@ -259,7 +259,7 @@ class MSFAMTrainer:
         with torch.no_grad():
             teacher_features = self.teacher_extractor(images)
         
-        feature_loss = 0
+        feature_loss = torch.tensor(0.0, device=self.device)
         for layer_name in self.layer_names:
             if layer_name in student_features and layer_name in teacher_features:
                 s_feat = student_features[layer_name]
@@ -272,7 +272,7 @@ class MSFAMTrainer:
                 if np.random.random() < 0.1:  # 10% of the time
                     w_loss = self.wasserstein_loss(s_feat, t_feat)
                 else:
-                    w_loss = 0
+                    w_loss = torch.tensor(0.0, device=self.device)
                 
                 feature_loss += l2_loss + 0.01 * w_loss
         

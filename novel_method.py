@@ -105,24 +105,35 @@ class AdaptiveUncertaintyMixup:
         # Early training: more mixing, late training: less mixing
         alpha_schedule = self.alpha * (1.0 - 0.5 * epoch_progress)
         
-        indices = torch.randperm(batch_size)
+        indices = torch.randperm(batch_size, device=images.device)
         mixed_images = images.clone()
-        mixed_labels = labels.clone()
         
-        for i in range(batch_size):
-            # Higher uncertainty = more conservative mixing
-            lam = np.random.beta(alpha_schedule, alpha_schedule)
-            uncertainty_factor = torch.sigmoid((uncertainty[i] - self.uncertainty_ema) / 0.1).item()
-            lam = lam * (1 - 0.3 * uncertainty_factor)
+        # Convert hard labels to soft labels if needed
+        if len(labels.shape) == 1:
+            num_classes = labels.max().item() + 1
+            mixed_labels = torch.zeros(batch_size, num_classes, device=labels.device)
             
-            mixed_images[i] = lam * images[i] + (1 - lam) * images[indices[i]]
-            
-            # Soft labels for mixup
-            if len(labels.shape) == 1:  # Hard labels
-                soft_label = torch.zeros(labels.max() + 1, device=labels.device)
-                soft_label[labels[i]] = lam
-                soft_label[labels[indices[i]]] += (1 - lam)
-                mixed_labels[i] = soft_label
+            for i in range(batch_size):
+                # Higher uncertainty = more conservative mixing
+                lam = np.random.beta(alpha_schedule, alpha_schedule)
+                uncertainty_factor = torch.sigmoid((uncertainty[i] - self.uncertainty_ema) / 0.1).item()
+                lam = lam * (1 - 0.3 * uncertainty_factor)
+                
+                mixed_images[i] = lam * images[i] + (1 - lam) * images[indices[i]]
+                
+                # Create soft labels
+                mixed_labels[i, labels[i]] = lam
+                mixed_labels[i, labels[indices[i]]] += (1 - lam)
+        else:
+            # Already soft labels
+            mixed_labels = labels.clone()
+            for i in range(batch_size):
+                lam = np.random.beta(alpha_schedule, alpha_schedule)
+                uncertainty_factor = torch.sigmoid((uncertainty[i] - self.uncertainty_ema) / 0.1).item()
+                lam = lam * (1 - 0.3 * uncertainty_factor)
+                
+                mixed_images[i] = lam * images[i] + (1 - lam) * images[indices[i]]
+                mixed_labels[i] = lam * labels[i] + (1 - lam) * labels[indices[i]]
         
         return mixed_images, mixed_labels
 

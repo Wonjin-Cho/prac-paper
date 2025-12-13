@@ -73,7 +73,12 @@ class AdaptiveUncertaintyMixup:
     def compute_uncertainty(self, images):
         """Compute prediction uncertainty using entropy"""
         with torch.no_grad():
-            logits = self.teacher_model(images)
+            output = self.teacher_model(images)
+            # Handle both single output and tuple (logits, features)
+            if isinstance(output, tuple):
+                logits = output[0]
+            else:
+                logits = output
             probs = F.softmax(logits, dim=1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
         return entropy
@@ -187,13 +192,13 @@ class MSFAMTrainer:
         # Adaptive mixup
         self.mixup = AdaptiveUncertaintyMixup(self.teacher)
         
-        # NEW: Contrastive learning head
+        # Contrastive learning head
         self.contrastive_head = ContrastiveLearningHead(feature_dim=512, projection_dim=128).to(device)
         
-        # NEW: Feature discriminator for adversarial alignment
+        # Feature discriminator for adversarial alignment
         self.discriminator = FeatureDiscriminator(feature_dim=512).to(device)
         
-        # NEW: Hard sample miner
+        # Hard sample miner
         self.hard_miner = HardSampleMiner(percentile=0.7)
         
         self.teacher.eval()
@@ -311,7 +316,7 @@ class MSFAMTrainer:
         with torch.no_grad():
             _, teacher_feat = self.teacher(mixed_images)
         
-        # NEW: Hard sample mining
+        # Hard sample mining
         hard_mask, difficulty = self.hard_miner.get_hard_samples(student_logits, teacher_logits, labels)
         hard_weight = torch.ones_like(difficulty)
         hard_weight[hard_mask] = 2.0  # Double weight for hard samples
@@ -339,15 +344,13 @@ class MSFAMTrainer:
         # Feature alignment loss
         feat_loss = self.compute_feature_alignment_loss(mixed_images)
         
-        # NEW: Contrastive loss (self-supervised)
-        # Create two augmented views
+        # Contrastive loss (self-supervised)
         contrastive_loss = self.compute_contrastive_loss(student_feat, teacher_feat)
         
-        # NEW: Adversarial feature alignment
+        # Adversarial feature alignment
         adv_student_loss, adv_disc_loss = self.compute_adversarial_loss(student_feat, teacher_feat)
         
-        # NEW: Feature consistency regularization
-        # Ensure features are consistent across different forward passes
+        # Feature consistency regularization
         with torch.no_grad():
             _, student_feat2 = self.student(mixed_images)
         consistency_loss = F.mse_loss(student_feat, student_feat2)

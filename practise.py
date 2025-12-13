@@ -574,20 +574,14 @@ def Practise_one_block(rm_block,
     if args.cuda:
         torch.cuda.empty_cache()
 
-    # Check if rm_block is a list with multiple blocks
-    if isinstance(rm_block, list) and len(rm_block) > 1:
-        print(f"\n{'='*60}")
-        print(f"PROGRESSIVE ITERATIVE PRUNING: {len(rm_block)} blocks")
-        print(f"Blocks to prune: {rm_block}")
-        print(f"{'='*60}\n")
+    # Force one-shot pruning for all cases
+    print("\n" + "="*70)
+    print(f"PRUNING STRATEGY: One-shot ({len(rm_block) if isinstance(rm_block, list) else 1} block(s))")
+    print(f"Target blocks: {rm_block}")
+    print("All blocks will be pruned simultaneously")
+    print("="*70 + "\n")
 
-        # Use progressive iterative pruning for better performance
-        pruned_model, recoverability, lat_reduction, score = progressive_iterative_pruning(
-            rm_block, origin_model, origin_lat, train_loader, metric_loader,
-            args)
-        return pruned_model, (recoverability, lat_reduction, score)
-
-    # Single block pruning (original logic)
+    # Build pruned model
     pruned_model, _, pruned_lat = build_student(
         args.model,
         rm_block,
@@ -613,7 +607,6 @@ def Practise_one_block(rm_block,
     pruned_model_adaptor.remove_all_afterconv()
 
     score = 0
-    device = "cuda"
     return pruned_model, (recoverability, lat_reduction, score)
 
 
@@ -1337,7 +1330,7 @@ def train_progressive(train_loader,
     dgkd_criterion = DGKDLoss(
         teacher_channels=teacher_channels[:3],
         student_channels=student_channels,
-        num_epochs=args.epochs
+        num_epochs=args.epoch
     )
 
 
@@ -1436,7 +1429,7 @@ def train_progressive(train_loader,
                 }
                 # Extract features for DGKD
                 teacher_features_dgkd = extract_features_for_dgkd(
-                    origin_model, data, layer_names_teacher, device)
+                    origin_model, data, layer_names_teacher)
 
 
             student_features_dict, student_logits = extract_features_from_model(
@@ -1452,7 +1445,7 @@ def train_progressive(train_loader,
             }
             # Extract features for DGKD
             student_features_dgkd = extract_features_for_dgkd(
-                model, data, layer_names_student, device)
+                model, data, layer_names_student)
 
 
             # Compute AMFR-CR loss

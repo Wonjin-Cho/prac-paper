@@ -188,19 +188,19 @@ class EnhancedMSFAMTrainer:
         
     def compute_adversarial_loss(self, student_feat, teacher_feat):
         """Adversarial feature matching"""
-        # Discriminator tries to distinguish student from teacher
-        real_score = self.discriminator(teacher_feat.detach())
-        fake_score = self.discriminator(student_feat)
+        # Create detached copies for discriminator training
+        student_feat_detached = student_feat.detach()
+        teacher_feat_detached = teacher_feat.detach()
         
-        # Generator loss (student wants to fool discriminator)
-        gen_loss = -torch.mean(fake_score)
+        # Discriminator loss (separate from main graph)
+        real_score = self.discriminator(teacher_feat_detached)
+        fake_score_d = self.discriminator(student_feat_detached)
         
-        # Discriminator loss
-        disc_loss = torch.mean(fake_score) - torch.mean(real_score)
+        disc_loss = torch.mean(fake_score_d) - torch.mean(real_score)
         
         # Gradient penalty for stability
         alpha = torch.rand(student_feat.size(0), 1, 1, 1, device=self.device)
-        interpolated = (alpha * teacher_feat + (1 - alpha) * student_feat).requires_grad_(True)
+        interpolated = (alpha * teacher_feat_detached + (1 - alpha) * student_feat_detached).requires_grad_(True)
         d_interpolated = self.discriminator(interpolated)
         
         gradients = torch.autograd.grad(
@@ -208,11 +208,16 @@ class EnhancedMSFAMTrainer:
             inputs=interpolated,
             grad_outputs=torch.ones_like(d_interpolated),
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
+            only_inputs=True
         )[0]
         
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        disc_loss += 10 * gradient_penalty
+        disc_loss = disc_loss + 10 * gradient_penalty
+        
+        # Generator loss (connected to main graph, no detach)
+        fake_score_g = self.discriminator(student_feat)
+        gen_loss = -torch.mean(fake_score_g)
         
         return gen_loss, disc_loss
     
@@ -320,9 +325,10 @@ class EnhancedMSFAMTrainer:
         # 6. Adversarial feature matching
         gen_loss, disc_loss = self.compute_adversarial_loss(student_feat, teacher_feat)
         
-        # Update discriminator
+        # Update discriminator (separate from main optimization)
         self.disc_optimizer.zero_grad()
-        disc_loss.backward(retain_graph=True)
+        disc_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         self.disc_optimizer.step()
         
         # 7. Feature magnitude matching

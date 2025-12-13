@@ -104,7 +104,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--FT",
-    default="",
+    default="BP",
     type=str,
     help="method for finetuning",
     choices=["", "BP", "MiR"],
@@ -180,9 +180,9 @@ def main():
     # python main.py --num_sample 500 --seed 2021 --epoch 100 --practise one --rm_blocks layer1.1 --gpu_id 0
     args.num_sample = 1280
     args.seed = 2021
-    args.epoch = 2500  # Increased for noisy synthetic data
+    args.epoch = 1200  # Further increased for better convergence
     args.state_dict_path = ""
-    args.lr = 0.01  # Reduced LR for synthetic data (was 0.02)
+    args.lr = 0.015  # Slightly lower initial LR
     args.practise = "all"
     args.rm_blocks = "1"
     args.gpu_id = "0"
@@ -319,30 +319,6 @@ def main():
 
     test_loader = dataset.__dict__[args.eval_dataset](False, args.test_batch_size)
 
-    # Create sampled metric loader (1/10th of original)
-    if args.practise:
-        full_metric_dataset = metric_loader.dataset
-        total_samples = len(full_metric_dataset)
-        sample_size = total_samples // 10
-        
-        print(f"Original metric dataset size: {total_samples}")
-        print(f"Sampled metric dataset size: {sample_size}")
-        
-        # Random sampling
-        np.random.seed(args.seed)
-        sampled_indices = np.random.choice(total_samples, size=sample_size, replace=False)
-        sampled_dataset = torch.utils.data.Subset(full_metric_dataset, sampled_indices)
-        
-        # Create new metric loader with sampled dataset
-        metric_loader = torch.utils.data.DataLoader(
-            sampled_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=8,
-            pin_memory=False
-        )
-        print(f"Created sampled metric loader with {len(sampled_dataset)} images")
-
     origin_model, all_blocks, origin_lat = build_teacher(
         args.model, args.num_classes, teacher=args.teacher, cuda=args.cuda
     )
@@ -363,21 +339,15 @@ def main():
         )
     elif args.practise == "all":
         rm_blocks = []
-        
-        # Define blocks to prune (can be single or multiple)
-        # For 3-block pruning with progressive iterative approach:
+        # pruned_model, rm_blocks, pruned_lat = Practise_all_blocks(all_blocks, origin_model, origin_lat, train_loader, metric_loader, args, rm_blocks)
+
+        # rm_blocks = ['layer2.2', 'layer3.2', 'layer1.2', 'layer3.3', 'layer1.1']
+        # ['layer1.2', 'layer2.2', 'layer3.2', 'layer3.3', 'layer3.4', 'layer3.1']
+        # rm_blocks = ['layer1.2', 'layer2.3', 'layer2.2']#, 'layer2.3', 'layer3.3']#,'layer3.4']
+        # rm_blocks = ['layer4.2', 'layer3.2', 'layer1.2', 'layer1.1', 'layer2.3']
+        # rm_blocks = ["layer1.1", "layer1.2", "layer2.2", "layer2.3", "layer3.3"]
         rm_blocks = ["layer1.1", "layer1.2", "layer3.3"]
-        
-        print(f"\n{'='*70}")
-        print(f"PRUNING STRATEGY: Progressive Iterative (3 blocks)")
-        print(f"Target blocks: {rm_blocks}")
-        print(f"This will prune blocks one-by-one with intermediate training")
-        print(f"Expected to achieve better performance than one-shot pruning")
-        print(f"{'='*70}\n")
-        
-        # Progressive iterative pruning will be automatically triggered
-        # when rm_blocks has more than 1 block
-        pruned_model, results = Practise_one_block(
+        pruned_model, _ = Practise_one_block(
             rm_blocks,
             origin_model,
             origin_lat,
@@ -386,14 +356,17 @@ def main():
             args,
             len(rm_blocks),
         )
-        
-        recoverability, lat_reduction, score = results
-        print(f"\n{'='*70}")
-        print(f"FINAL RESULTS:")
-        print(f"  Blocks pruned: {len(rm_blocks)}")
-        print(f"  Latency reduction: {lat_reduction:.2f}%")
-        print(f"  Final score: {score:.4f}")
-        print(f"{'='*70}\n")
+        # rm_blocks = ["layer3.3"]  # , 'layer2.1']
+        # rm_blocks = ['layer2.1']#, 'layer2.2', 'layer3.2', 'layer3.3'] # 'layer1.2', 'layer2.2',
+        pruned_model1, _ = Practise_one_block(
+            rm_blocks,
+            pruned_model,
+            origin_lat,
+            train_loader,
+            metric_loader,
+            args,
+            len(rm_blocks),
+        )
 
     else:
         pruned_model, _, pruned_lat = build_student(

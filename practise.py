@@ -1,3 +1,4 @@
+
 import os
 import gc
 import argparse
@@ -34,22 +35,18 @@ from past_src.generate_data import arg_parse
 
 class ModelEMA:
     """Exponential Moving Average for model parameters"""
-
     def __init__(self, model, decay=0.9999):
         self.module = copy.deepcopy(model)
         self.module.eval()
         self.decay = decay
-
+        
     def update(self, model):
         with torch.no_grad():
-            for ema_param, model_param in zip(self.module.parameters(),
-                                              model.parameters()):
-                ema_param.data.mul_(self.decay).add_(model_param.data,
-                                                     alpha=1 - self.decay)
-
+            for ema_param, model_param in zip(self.module.parameters(), model.parameters()):
+                ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1 - self.decay)
+                
     def state_dict(self):
         return self.module.state_dict()
-
 
 import os
 import gc
@@ -97,8 +94,7 @@ def assert_finite(name, tensor):
                 mx = torch.nanmax(tensor)
             except Exception:
                 mn, mx = float("nan"), float("nan")
-            print(
-                f"[NaN/Inf] {name} has non-finite values (min={mn}, max={mx})")
+            print(f"[NaN/Inf] {name} has non-finite values (min={mn}, max={mx})")
             return False
     except Exception:
         print(f"[assert_finite] could not check {name} (type={type(tensor)})")
@@ -254,7 +250,8 @@ def print_batchnorm_gamma_summary(model):
 
     # Print overall statistics
     all_gammas = np.concatenate(
-        [data["gamma_values"] for data in gamma_values.values()])
+        [data["gamma_values"] for data in gamma_values.values()]
+    )
     print(f"\n" + "=" * 80)
     print("OVERALL STATISTICS:")
     print(f"Total BatchNorm layers: {len(gamma_values)}")
@@ -268,8 +265,7 @@ def print_batchnorm_gamma_summary(model):
     return gamma_values
 
 
-def save_batchnorm_gamma_to_file(model,
-                                 filename="batchnorm_gamma_values.pickle"):
+def save_batchnorm_gamma_to_file(model, filename="batchnorm_gamma_values.pickle"):
     """
     Save BatchNorm gamma values to a pickle file for later analysis.
 
@@ -313,7 +309,8 @@ def analyze_batchnorm_gamma_distribution(model, save_plot=True):
 
     # Plot 1: Histogram of all gamma values
     all_gammas = np.concatenate(
-        [data["gamma_values"] for data in gamma_values.values()])
+        [data["gamma_values"] for data in gamma_values.values()]
+    )
     axes[0, 0].hist(all_gammas, bins=50, alpha=0.7, edgecolor="black")
     axes[0, 0].set_title("Distribution of All Gamma Values")
     axes[0, 0].set_xlabel("Gamma Value")
@@ -455,8 +452,7 @@ def analyze_channel_similarities(model, layer_names):
 
         # Find most similar channel pairs
         np.fill_diagonal(similarity_np, -1)  # Exclude self-similarity
-        max_sim_idx = np.unravel_index(np.argmax(similarity_np),
-                                       similarity_np.shape)
+        max_sim_idx = np.unravel_index(np.argmax(similarity_np), similarity_np.shape)
         print(
             f"Most similar channels: {max_sim_idx} with similarity {similarity_np[max_sim_idx]:.4f}"
         )
@@ -524,13 +520,11 @@ def get_block_features(model, block_name, data_loader, num_batches=10):
             # Store features
             if input_hook.outputs is not None:
                 # Flatten spatial dimensions and average across batch
-                input_feat = input_hook.outputs.view(
-                    input_hook.outputs.size(0), -1)
+                input_feat = input_hook.outputs.view(input_hook.outputs.size(0), -1)
                 input_features.append(input_feat.mean(dim=0).cpu())
             if output_hook.outputs is not None:
                 # Flatten spatial dimensions and average across batch
-                output_feat = output_hook.outputs.view(
-                    output_hook.outputs.size(0), -1)
+                output_feat = output_hook.outputs.view(output_hook.outputs.size(0), -1)
                 output_features.append(output_feat.mean(dim=0).cpu())
 
     # Average features across batches
@@ -540,10 +534,7 @@ def get_block_features(model, block_name, data_loader, num_batches=10):
     return input_features, output_features
 
 
-def compute_block_similarities(model,
-                               target_block,
-                               data_loader,
-                               num_batches=10):
+def compute_block_similarities(model, target_block, data_loader, num_batches=10):
     """
     Compute similarities between target block and all other blocks.
     Args:
@@ -555,8 +546,9 @@ def compute_block_similarities(model,
         similarities: Dictionary containing similarity matrices
     """
     # Get target block features
-    target_input, target_output = get_block_features(model, target_block,
-                                                     data_loader, num_batches)
+    target_input, target_output = get_block_features(
+        model, target_block, data_loader, num_batches
+    )
 
     # Get all block names (only BasicBlock or Bottleneck)
     block_names = []
@@ -574,7 +566,8 @@ def compute_block_similarities(model,
     for block_name in block_names:
         if block_name != target_block:
             block_input, block_output = get_block_features(
-                model, block_name, data_loader, num_batches)
+                model, block_name, data_loader, num_batches
+            )
 
             # Ensure features have the same dimension
             min_dim = min(target_input.size(0), block_input.size(0))
@@ -586,11 +579,12 @@ def compute_block_similarities(model,
             block_output_trimmed = block_output[:min_dim]
 
             # Compute cosine similarities
-            input_sim = F.cosine_similarity(target_input_trimmed.unsqueeze(0),
-                                            block_input_trimmed.unsqueeze(0))
+            input_sim = F.cosine_similarity(
+                target_input_trimmed.unsqueeze(0), block_input_trimmed.unsqueeze(0)
+            )
             output_sim = F.cosine_similarity(
-                target_output_trimmed.unsqueeze(0),
-                block_output_trimmed.unsqueeze(0))
+                target_output_trimmed.unsqueeze(0), block_output_trimmed.unsqueeze(0)
+            )
 
             similarities["input"][block_name] = input_sim.item()
             similarities["output"][block_name] = output_sim.item()
@@ -598,9 +592,9 @@ def compute_block_similarities(model,
     return similarities
 
 
-def plot_block_similarities(similarities,
-                            target_block,
-                            save_path="block_similarities.png"):
+def plot_block_similarities(
+    similarities, target_block, save_path="block_similarities.png"
+):
     """
     Plot similarities between target block and all other blocks.
     Args:
@@ -658,10 +652,7 @@ def plot_block_similarities(similarities,
     )
 
 
-def compute_block_io_similarity(model,
-                                block_name,
-                                data_loader,
-                                num_batches=10):
+def compute_block_io_similarity(model, block_name, data_loader, num_batches=10):
     """
     Compute cosine similarity between input and output features of a specific block.
     Args:
@@ -673,7 +664,8 @@ def compute_block_io_similarity(model,
         float: Average cosine similarity between input and output features
     """
     input_features, output_features = get_block_features(
-        model, block_name, data_loader, num_batches)
+        model, block_name, data_loader, num_batches
+    )
 
     # Ensure features have the same dimension
     min_dim = min(input_features.size(0), output_features.size(0))
@@ -681,16 +673,16 @@ def compute_block_io_similarity(model,
     output_features = output_features[:min_dim]
 
     # Compute cosine similarity
-    similarity = F.cosine_similarity(input_features.unsqueeze(0),
-                                     output_features.unsqueeze(0))
+    similarity = F.cosine_similarity(
+        input_features.unsqueeze(0), output_features.unsqueeze(0)
+    )
 
     return similarity.item()
 
 
-def analyze_block_io_similarities(model,
-                                  data_loader,
-                                  save_path="block_io_similarities.png",
-                                  skip_blocks=None):
+def analyze_block_io_similarities(
+    model, data_loader, save_path="block_io_similarities.png", skip_blocks=None
+):
     """
     Analyze and visualize input-output similarities for all blocks.
     Args:
@@ -716,8 +708,7 @@ def analyze_block_io_similarities(model,
     # Compute similarities for each block
     similarities = {}
     for block_name in block_names:
-        similarity = compute_block_io_similarity(model, block_name,
-                                                 data_loader)
+        similarity = compute_block_io_similarity(model, block_name, data_loader)
         similarities[block_name] = similarity
 
     # Sort blocks by similarity
@@ -756,10 +747,7 @@ def analyze_block_io_similarities(model,
     # Save raw data
     np.save(
         save_path.replace(".png", "_data.npy"),
-        {
-            "blocks": block_names,
-            "similarities": sim_values
-        },
+        {"blocks": block_names, "similarities": sim_values},
     )
 
     return similarities
@@ -791,30 +779,12 @@ def compute_similarity(feature1, feature2):
     return cos_per_sample.mean().item()
 
 
-def Practise_one_block(rm_block,
-                       origin_model,
-                       origin_lat,
-                       train_loader,
-                       metric_loader,
-                       args,
-                       drop_blocks=0):
+def Practise_one_block(
+    rm_block, origin_model, origin_lat, train_loader, metric_loader, args, drop_blocks=0
+):
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Check if rm_block is a list with multiple blocks
-    if isinstance(rm_block, list) and len(rm_block) > 1:
-        print(f"\n{'='*60}")
-        print(f"PROGRESSIVE ITERATIVE PRUNING: {len(rm_block)} blocks")
-        print(f"Blocks to prune: {rm_block}")
-        print(f"{'='*60}\n")
-
-        # Use progressive iterative pruning for better performance
-        pruned_model, recoverability, lat_reduction, score = progressive_iterative_pruning(
-            rm_block, origin_model, origin_lat, train_loader, metric_loader,
-            args)
-        return pruned_model, (recoverability, lat_reduction, score)
-
-    # Single block pruning (original logic)
     pruned_model, _, pruned_lat = build_student(
         args.model,
         rm_block,
@@ -826,11 +796,13 @@ def Practise_one_block(rm_block,
     lat_reduction = (origin_lat - pruned_lat) / origin_lat * 100
     print(f"=> latency reduction: {lat_reduction:.2f}%")
 
+    # print("Metric w/o Recovering:")
+    # metric(metric_loader, pruned_model, origin_model)
+
     pruned_model_adaptor = AdaptorWarp(pruned_model)
 
     start_time = time.time()
-    Practise_recover(train_loader, origin_model, pruned_model_adaptor,
-                     rm_block, args)
+    Practise_recover(train_loader, origin_model, pruned_model_adaptor, rm_block, args)
     print("Total time: {:.3f}s".format(time.time() - start_time))
 
     print("Metric w/ Recovering:")
@@ -838,133 +810,21 @@ def Practise_one_block(rm_block,
     pruned_model_adaptor.remove_all_preconv()
     pruned_model_adaptor.remove_all_afterconv()
 
+    # score = recoverability / lat_reduction
     score = 0
+    # print(f"{rm_block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
     device = "cuda"
-    return pruned_model, (recoverability, lat_reduction, score)
-
-
-def progressive_iterative_pruning(rm_blocks, origin_model, origin_lat,
-                                  train_loader, metric_loader, args):
-    """
-    Progressive iterative pruning: Remove blocks one-by-one with intermediate training.
-    This helps the model adapt gradually to capacity reduction.
-    
-    Args:
-        rm_blocks: List of blocks to remove (e.g., ['layer1.1', 'layer1.2', 'layer3.3'])
-        origin_model: Teacher model
-        origin_lat: Original latency
-        train_loader: Training data loader
-        metric_loader: Validation data loader
-        args: Arguments
-    
-    Returns:
-        Final pruned model with all blocks removed
-    """
-    # Sort blocks by layer to prune from early to late layers
-    sorted_blocks = sorted(rm_blocks,
-                           key=lambda x:
-                           (int(x.split('.')[0][-1]), int(x.split('.')[1])))
-    print(f"Pruning order: {sorted_blocks}")
-
-    # Store epochs for progressive training
-    original_epochs = args.epoch
-    per_block_epochs = max(800, original_epochs //
-                           len(sorted_blocks))  # At least 800 epochs per block
-
-    current_model = origin_model
-    cumulative_blocks = []
-
-    for i, block in enumerate(sorted_blocks):
-        print(f"\n{'='*60}")
-        print(f"ITERATION {i+1}/{len(sorted_blocks)}: Pruning block '{block}'")
-        print(f"Previously pruned: {cumulative_blocks}")
-        print(f"{'='*60}\n")
-
-        cumulative_blocks.append(block)
-
-        # Build student with cumulative blocks removed
-        pruned_model, _, pruned_lat = build_student(
-            args.model,
-            cumulative_blocks,
-            args.num_classes,
-            state_dict_path=args.state_dict_path,
-            teacher=args.teacher,
-            cuda=args.cuda,
-        )
-
-        lat_reduction = (origin_lat - pruned_lat) / origin_lat * 100
-        print(f"=> Cumulative latency reduction: {lat_reduction:.2f}%")
-
-        # Wrap with adaptors
-        pruned_model_adaptor = AdaptorWarp(pruned_model)
-
-        # Progressive epoch allocation: more epochs for later iterations
-        if i == len(sorted_blocks) - 1:
-            # Final iteration gets 1.5x epochs for fine-tuning
-            current_epochs = int(per_block_epochs * 1.5)
-        else:
-            current_epochs = per_block_epochs
-
-        # Temporarily update args.epoch
-        args.epoch = current_epochs
-        print(f"Training for {current_epochs} epochs")
-
-        # Recover with progressive training
-        start_time = time.time()
-        Practise_recover(train_loader, current_model, pruned_model_adaptor,
-                         cumulative_blocks, args)
-        print(f"Recovery time: {time.time() - start_time:.3f}s")
-
-        # Evaluate intermediate performance
-        print(f"\nEvaluating after pruning block '{block}':")
-        recoverability, acc, origin_acc, _ = metric(metric_loader,
-                                                    pruned_model_adaptor,
-                                                    origin_model)
-        print(
-            f"Recoverability: {recoverability:.4f}, Acc: {acc:.2f}%, Teacher Acc: {origin_acc:.2f}%"
-        )
-
-        # Remove adaptors and absorb them into the model
-        pruned_model_adaptor.remove_all_preconv(absorb=True)
-        pruned_model_adaptor.remove_all_afterconv(absorb=True)
-
-        # Update current model for next iteration (use pruned model as new teacher)
-        current_model = pruned_model_adaptor.model
-
-        # Clear cache
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    # Restore original epochs
-    args.epoch = original_epochs
-
-    # Final evaluation
-    print(f"\n{'='*60}")
-    print("FINAL EVALUATION after all blocks pruned")
-    print(f"{'='*60}\n")
-
-    final_recoverability, final_acc, origin_acc, _ = metric(
-        metric_loader, current_model, origin_model)
-
-    # Calculate final latency reduction
-    _, _, final_lat = build_student(
-        args.model,
-        cumulative_blocks,
-        args.num_classes,
-        state_dict_path=args.state_dict_path,
-        teacher=args.teacher,
-        cuda=args.cuda,
+    DD = DistillData(args)
+    dataloader = DD.get_distil_data(
+        model_name=args.model,
+        teacher_model=origin_model.cuda(),
+        batch_size=args.batch_size,
+        group=args.group,
+        beta=0.1,
+        gamma=0.5,
+        save_path_head=args.save_path_head,
     )
-    final_lat_reduction = (origin_lat - final_lat) / origin_lat * 100
-
-    print(f"\nProgressive Iterative Pruning Complete!")
-    print(f"Final Accuracy: {final_acc:.2f}% (Teacher: {origin_acc:.2f}%)")
-    print(f"Final Latency Reduction: {final_lat_reduction:.2f}%")
-    print(f"Total blocks pruned: {len(cumulative_blocks)}")
-
-    score = final_acc  # Use accuracy as score
-
-    return current_model, final_recoverability, final_lat_reduction, score
+    return pruned_model, (recoverability, lat_reduction, score)
 
 
 def Practise_all_blocks(
@@ -978,16 +838,16 @@ def Practise_all_blocks(
 ):
     recoverabilities = dict()
     for rm_block in rm_blocks:
-        _, results = Practise_one_block(rm_block, origin_model, origin_lat,
-                                        train_loader, metric_loader, args)
+        _, results = Practise_one_block(
+            rm_block, origin_model, origin_lat, train_loader, metric_loader, args
+        )
         recoverabilities[rm_block] = results
 
     print("-" * 50)
     sort_list = []
     for block in recoverabilities:
         recoverability, lat_reduction, score = recoverabilities[block]
-        print(
-            f"{block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
+        print(f"{block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
         sort_list.append([score, block])
     print("-" * 50)
     print("=> sorted")
@@ -995,9 +855,7 @@ def Practise_all_blocks(
     for score, block in sort_list:
         print(f"{block} -> {score:.4f}")
     print("-" * 50)
-    print(
-        f"=> scores of {args.model} (#data:{args.num_sample}, seed={args.seed})"
-    )
+    print(f"=> scores of {args.model} (#data:{args.num_sample}, seed={args.seed})")
     print("Please use this seed to recover the model!")
     print("-" * 50)
 
@@ -1096,6 +954,7 @@ def Practise_all_blocks(
 
 #     return pruned_model, (recoverability, lat_reduction, score)
 
+
 # def Practise_all_blocks(
 #     rm_blocks, origin_model, origin_lat, train_loader, metric_loader, args, drop_blocks
 # ):
@@ -1161,8 +1020,9 @@ def Practise_all_blocks(
 #     return pruned_model, drop_blocks, pruned_lat
 
 
-def insert_one_block_adaptors_for_mobilenet(origin_model, prune_model,
-                                            rm_block, params, args):
+def insert_one_block_adaptors_for_mobilenet(
+    origin_model, prune_model, rm_block, params, args
+):
     origin_named_modules = dict(origin_model.named_modules())
     pruned_named_modules = dict(prune_model.model.named_modules())
 
@@ -1225,8 +1085,7 @@ def insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args):
             params.append({"params": conv.parameters()})
 
     for origin_block_num in range(rm_block_id):
-        last_conv_key = "{}.{}.{}".format(layer, origin_block_num,
-                                          last_conv_in_block)
+        last_conv_key = "{}.{}.{}".format(layer, origin_block_num, last_conv_in_block)
         conv = prune_model.add_afterconv_for_conv(last_conv_key)
         if conv is not None:
             params.append({"params": conv.parameters()})
@@ -1254,8 +1113,7 @@ def insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args):
             params.append({"params": conv.parameters()})
 
 
-def insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks,
-                                   params, args):
+def insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks, params, args):
     rm_blocks_for_prune = []
     rm_blocks.sort()
     rm_count = [0, 0, 0, 0]
@@ -1272,21 +1130,15 @@ def insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks,
         rm_count[l_id - 1] += 1
         rm_block_prune = f"{layer}.{prune_b_id}"
         rm_blocks_for_prune.append(rm_block_prune)
-
+    
     # Add layer-wise learning rates for adaptors
     for rm_block in rm_blocks_for_prune:
         layer_num = int(rm_block.split('.')[0][-1])
         # Higher LR for layers closer to pruned block
         lr_multiplier = 2.0 if layer_num <= 2 else 1.0
-        insert_one_block_adaptors_for_resnet(prune_model, rm_block, params,
-                                             args, lr_multiplier)
+        insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args, lr_multiplier)
 
-
-def insert_one_block_adaptors_for_resnet(prune_model,
-                                         rm_block,
-                                         params,
-                                         args,
-                                         lr_multiplier=1.0):
+def insert_one_block_adaptors_for_resnet(prune_model, rm_block, params, args, lr_multiplier=1.0):
     pruned_named_modules = dict(prune_model.model.named_modules())
     if "layer1.0.conv2" in pruned_named_modules:
         last_conv_in_block = "conv2"
@@ -1310,20 +1162,13 @@ def insert_one_block_adaptors_for_resnet(prune_model,
     if downsample in pruned_named_modules:
         conv = prune_model.add_afterconv_for_conv(downsample)
         if conv is not None:
-            params.append({
-                "params": conv.parameters(),
-                "lr": args.lr * lr_multiplier
-            })
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
     for origin_block_num in range(rm_block_id):
-        last_conv_key = "{}.{}.{}".format(layer, origin_block_num,
-                                          last_conv_in_block)
+        last_conv_key = "{}.{}.{}".format(layer, origin_block_num, last_conv_in_block)
         conv = prune_model.add_afterconv_for_conv(last_conv_key)
         if conv is not None:
-            params.append({
-                "params": conv.parameters(),
-                "lr": args.lr * lr_multiplier
-            })
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
     for origin_block_num in range(rm_block_id + 1, 100):
         pruned_output_key = "{}.{}.conv1".format(layer, origin_block_num - 1)
@@ -1331,30 +1176,21 @@ def insert_one_block_adaptors_for_resnet(prune_model,
             break
         conv = prune_model.add_preconv_for_conv(pruned_output_key)
         if conv is not None:
-            params.append({
-                "params": conv.parameters(),
-                "lr": args.lr * lr_multiplier
-            })
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
     # next stage's conv1
     next_layer_conv1 = "layer{}.0.conv1".format(int(layer[-1]) + 1)
     if next_layer_conv1 in pruned_named_modules:
         conv = prune_model.add_preconv_for_conv(next_layer_conv1)
         if conv is not None:
-            params.append({
-                "params": conv.parameters(),
-                "lr": args.lr * lr_multiplier
-            })
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
     # next stage's downsample
     next_layer_downsample = "layer{}.0.downsample.0".format(int(layer[-1]) + 1)
     if next_layer_downsample in pruned_named_modules:
         conv = prune_model.add_preconv_for_conv(next_layer_downsample)
         if conv is not None:
-            params.append({
-                "params": conv.parameters(),
-                "lr": args.lr * lr_multiplier
-            })
+            params.append({"params": conv.parameters(), "lr": args.lr * lr_multiplier})
 
 
 def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
@@ -1362,293 +1198,83 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
 
     if "mobilenet" in args.model:
         assert len(rm_blocks) == 1
-        insert_one_block_adaptors_for_mobilenet(origin_model, prune_model,
-                                                rm_blocks[0], params, args)
+        insert_one_block_adaptors_for_mobilenet(
+            origin_model, prune_model, rm_blocks[0], params, args
+        )
     else:
-        insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks,
-                                       params, args)
-
-    # Detect if multiple blocks are being pruned
-    num_blocks = len(rm_blocks) if isinstance(rm_blocks, list) else 1
-    is_aggressive_pruning = num_blocks >= 3
-
-    if is_aggressive_pruning:
-        print(f"\n⚠️  Aggressive pruning detected ({num_blocks} blocks)")
-        print("Using enhanced training strategy with:")
-        print("  - Curriculum learning (easy→hard)")
-        print("  - Adaptive learning rate scheduling")
-        print("  - Stronger feature matching")
-        print("  - Gradient accumulation\n")
-
-    # Create EMA model for self-distillation
-    ema_model = ModelEMA(prune_model, decay=0.9996)
-
-    # Enhanced initialization: Initialize adaptors with small random perturbations
-    for param_dict in params:
-        for param in param_dict['params']:
-            if len(param.shape) == 4:  # Conv layer
-                # Small perturbation around identity
-                nn.init.kaiming_normal_(param,
-                                        mode='fan_out',
-                                        nonlinearity='relu')
-                param.data *= 0.1  # Scale down to stay close to identity
-
-                # Add identity component
-                if param.shape[0] == param.shape[1]:
-                    eye = torch.eye(param.shape[0]).view(
-                        param.shape[0], param.shape[1], 1, 1)
-                    param.data += eye.to(param.device)
+        insert_all_adaptors_for_resnet(
+            origin_model, prune_model, rm_blocks, params, args
+        )
 
     if args.opt == "SGD":
-        optimizer = torch.optim.SGD(params,
-                                    lr=args.lr,
-                                    momentum=args.momentum,
-                                    weight_decay=args.weight_decay)
+        optimizer = torch.optim.SGD(
+            params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
+        )
     elif args.opt == "Adam":
-        optimizer = torch.optim.Adam(params,
-                                     lr=args.lr,
-                                     weight_decay=args.weight_decay)
+        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.weight_decay)
     elif args.opt == "AdamW":
-        optimizer = torch.optim.AdamW(params,
-                                      lr=args.lr,
-                                      weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(
+            params, lr=args.lr, weight_decay=args.weight_decay
+        )
     else:
         raise ValueError("{} not found".format(args.opt))
 
     # Add cosine annealing scheduler with warmup
     warmup_epochs = int(0.1 * args.epoch)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                           T_max=args.epoch -
-                                                           warmup_epochs,
-                                                           eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epoch - warmup_epochs, eta_min=1e-6
+    )
 
     recover_time = time.time()
-
-    # For synthetic data: Longer phase 1 to learn robust features, shorter phase 2
-    # Phase 1: Train adaptors only (first 50% of epochs for synthetic data)
-    phase1_epochs = int(0.5 * args.epoch)  # Increased from 0.4
+    train(train_loader, optimizer, prune_model, origin_model, args, scheduler, warmup_epochs)
     print(
-        f"Phase 1: Training adaptors only for {phase1_epochs} epochs (synthetic data mode)"
+        "compute recoverability {} takes {}s".format(
+            rm_blocks, time.time() - recover_time
+        )
     )
-    print(
-        "Using noise-robust Huber loss and quality-weighted feature matching")
-    train_progressive(train_loader,
-                      optimizer,
-                      prune_model,
-                      origin_model,
-                      args,
-                      scheduler,
-                      warmup_epochs,
-                      phase1_epochs,
-                      phase=1,
-                      rm_blocks=rm_blocks)
-
-    # Phase 2: Progressive unfreezing (remaining 50% of epochs)
-    print(
-        f"Phase 2: Progressive unfreezing with BN adaptation (synthetic data mode)"
-    )
-    unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer)
-    train_progressive(train_loader,
-                      optimizer,
-                      prune_model,
-                      origin_model,
-                      args,
-                      scheduler,
-                      warmup_epochs,
-                      args.epoch - phase1_epochs,
-                      phase=2,
-                      rm_blocks=rm_blocks,
-                      start_epoch=phase1_epochs)
-
-    print("compute recoverability {} takes {}s".format(
-        rm_blocks,
-        time.time() - recover_time))
 
 
-def unfreeze_nearby_bn_layers(prune_model, rm_blocks, params, optimizer):
-    """Unfreeze BatchNorm layers near removed blocks for better adaptation"""
-    model = prune_model.model if hasattr(prune_model, 'model') else prune_model
-
-    # Get layers to unfreeze
-    layers_to_unfreeze = set()
-    for rm_block in rm_blocks:
-        parts = rm_block.split('.')
-        if len(parts) >= 2:
-            layer_name = parts[0]  # e.g., 'layer1'
-            layers_to_unfreeze.add(layer_name)
-
-    # Unfreeze BN parameters in those layers
-    bn_params = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.BatchNorm2d):
-            for layer in layers_to_unfreeze:
-                if name.startswith(layer):
-                    module.weight.requires_grad = True
-                    module.bias.requires_grad = True
-                    bn_params.extend([module.weight, module.bias])
-                    print(f"Unfroze BN layer: {name}")
-                    break
-
-    # Add BN parameters to optimizer
-    if bn_params:
-        optimizer.add_param_group({
-            'params': bn_params,
-            'lr': optimizer.param_groups[0]['lr'] * 0.1
-        })
-        print(f"Added {len(bn_params)} BN parameters to optimizer")
-
-
-def mixup_data(x, y, alpha=0.4):
-    """Apply mixup augmentation"""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).cuda()
-
-    mixed_x = lam * x + (1 - lam) * x[index]
-    index = index.to(y.device)
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-
-def feature_statistics_loss(student_feat, teacher_feat):
-    """Match channel-wise mean and variance"""
-    # Compute per-channel statistics
-    s_mean = student_feat.mean(dim=[0, 2, 3])
-    t_mean = teacher_feat.mean(dim=[0, 2, 3])
-
-    s_var = student_feat.var(dim=[0, 2, 3])
-    t_var = teacher_feat.var(dim=[0, 2, 3])
-
-    mean_loss = F.mse_loss(s_mean, t_mean)
-    var_loss = F.mse_loss(s_var, t_var)
-
-    return mean_loss + var_loss
-
-
-def spatial_attention_loss(student_feat, teacher_feat):
-    """Compute attention-weighted feature matching loss"""
-    # Compute spatial attention maps from teacher
-    B, C, H, W = teacher_feat.shape
-    teacher_attention = torch.mean(teacher_feat, dim=1,
-                                   keepdim=True)  # [B, 1, H, W]
-    teacher_attention = F.softmax(teacher_attention.view(B, -1),
-                                  dim=1).view(B, 1, H, W)
-
-    # Weight the feature difference by attention
-    weighted_diff = teacher_attention * (student_feat - teacher_feat)**2
-    return weighted_diff.mean()
-
-
-def train_progressive(train_loader,
-                      optimizer,
-                      model,
-                      origin_model,
-                      args,
-                      scheduler=None,
-                      warmup_epochs=0,
-                      max_epochs=None,
-                      phase=1,
-                      rm_blocks=None,
-                      start_epoch=0):
-    """Progressive training with multi-scale feature matching, adapted for noisy synthetic data"""
+def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
+    # Data loading code
     end = time.time()
+    criterion = torch.nn.MSELoss(reduction="mean")
 
-    # Detect aggressive pruning (3+ blocks)
-    num_blocks = len(rm_blocks) if rm_blocks and isinstance(rm_blocks,
-                                                            list) else 1
-    is_aggressive_pruning = num_blocks >= 3
-
-    # Use Huber loss instead of MSE for robustness to outliers in synthetic data
-    criterion = torch.nn.HuberLoss(reduction="mean", delta=1.0)
-
-    # Curriculum learning: Start with easier examples, gradually increase difficulty
-    if is_aggressive_pruning and phase == 1:
-        print("🎓 Curriculum Learning: Starting with easier samples")
-        curriculum_stage = 0  # 0=easy, 1=medium, 2=hard
-        curriculum_switch_iter = max_epochs // 3  # Switch every 1/3 of training
-
-    # Early stopping for synthetic data (prevent overfitting)
-    best_loss = float('inf')
-    patience_counter = 0
-    patience_limit = 100  # Stop if no improvement for 100 iterations
-
-    # Multi-scale feature extraction hooks
-    teacher_features_multi = {}
-    student_features_multi = {}
-
-    def get_activation(name, features_dict):
-
-        def hook(module, input, output):
-            features_dict[name] = output
-
-        return hook
-
-    # Register hooks for multi-scale features
-    origin_model.cuda().eval()
-    model.cuda().eval()
-
-    # Hook intermediate layers for multi-scale matching
-    if phase == 2:  # Only in phase 2
-        for name, module in origin_model.named_modules():
-            if 'layer' in name and len(
-                    name.split('.')) == 1:  # layer1, layer2, etc.
-                module.register_forward_hook(
-                    get_activation(name, teacher_features_multi))
-
-        for name, module in model.model.named_modules() if hasattr(
-                model, 'model') else model.named_modules():
-            if 'layer' in name and len(name.split('.')) == 1:
-                module.register_forward_hook(
-                    get_activation(name, student_features_multi))
-
+    # switch to train mode
+    origin_model.cuda()
+    origin_model.eval()
+    model.cuda()
+    model.eval()
     model.get_feat = "pre_GAP"
     origin_model.get_feat = "pre_GAP"
 
+    # Gradient accumulation
     accumulation_steps = 2
-    torch.cuda.empty_cache()
-    iter_nums = start_epoch
-    max_iters = max_epochs if max_epochs else args.epoch
-    finish = False
 
+    torch.cuda.empty_cache()
+    iter_nums = 0
+    finish = False
     while not finish:
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
-
         for batch_idx, (data, target) in enumerate(train_loader):
             iter_nums += 1
-            if iter_nums > start_epoch + max_iters:
+            if iter_nums > args.epoch:
                 finish = True
                 break
-
+            # measure data loading time
             data_time.update(time.time() - end)
-
+            # sanitize inputs
             if isinstance(data, torch.Tensor):
-                data = torch.nan_to_num(data, nan=0.0, posinf=1e6,
-                                        neginf=-1e6).cuda()
+                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
             else:
                 data = safe_to_device(data)
                 data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6)
 
-            # Apply mixup augmentation (only in phase 2 for stability)
-            # For synthetic data, use stronger augmentation to prevent overfitting
-            if phase == 2 and np.random.rand() < 0.7:  # Increased from 0.5
-                data, _, _, _ = mixup_data(
-                    data, target, alpha=0.3)  # Reduced alpha for more mixing
-
-            # Add slight Gaussian noise to synthetic images for regularization
-            if np.random.rand() < 0.3:
-                noise = torch.randn_like(data) * 0.02
-                data = data + noise
-                data = torch.clamp(data, -3, 3)  # Clamp to reasonable range
-
             with torch.no_grad():
                 t_output, t_features = origin_model(data)
 
+            # check teacher features
             if not assert_finite("t_features", t_features):
                 print("Skipping batch due to non-finite teacher features")
                 continue
@@ -1656,151 +1282,62 @@ def train_progressive(train_loader,
             optimizer.zero_grad()
             output, s_features = model(data)
 
+            # check student features
             if not assert_finite("s_features", s_features):
                 print("Skipping batch due to non-finite student features")
                 continue
 
-            # Main feature loss with spatial attention and statistics matching
-            # For synthetic data, reduce attention loss weight (it's more sensitive to noise)
-            attention_loss = spatial_attention_loss(s_features, t_features)
-            huber_loss = criterion(s_features, t_features)
-            stats_loss = feature_statistics_loss(s_features, t_features)
-
-            # Compute feature quality score (lower variance = higher quality)
-            with torch.no_grad():
-                feature_std = torch.std(s_features, dim=[2, 3]).mean()
-                quality_weight = torch.clamp(1.0 / (1.0 + feature_std), 0.5,
-                                             1.0)
-
-            # Adaptive loss weighting for aggressive pruning
-            if is_aggressive_pruning:
-                # Stronger feature matching for multi-block pruning
-                # Progressive difficulty: easier early, harder later
-                progress_ratio = (iter_nums - start_epoch) / max_iters
-
-                # Increase feature matching weight over time
-                huber_weight = 0.5 + 0.2 * progress_ratio  # 0.5 → 0.7
-                attention_weight = 0.15 + 0.15 * progress_ratio  # 0.15 → 0.3
-                stats_weight = 0.15
-
-                loss = huber_weight * huber_loss + attention_weight * attention_loss * quality_weight + stats_weight * stats_loss
-            else:
-                # Weighted loss: reduce attention weight for noisy synthetic data
-                loss = 0.6 * huber_loss + 0.2 * attention_loss * quality_weight + 0.2 * stats_loss
-
-            # Multi-scale feature matching in Phase 2
-            if phase == 2 and teacher_features_multi and student_features_multi:
-                multi_scale_loss = 0.0
-                scale_count = 0
-                for layer_name in teacher_features_multi:
-                    if layer_name in student_features_multi:
-                        t_feat = teacher_features_multi[layer_name]
-                        s_feat = student_features_multi[layer_name]
-
-                        # Spatial pooling to match dimensions if needed
-                        if t_feat.shape != s_feat.shape:
-                            pool_size = t_feat.shape[2] // s_feat.shape[
-                                2] if t_feat.shape[2] > s_feat.shape[2] else 1
-                            if pool_size > 1:
-                                t_feat = F.adaptive_avg_pool2d(
-                                    t_feat, s_feat.shape[2:])
-
-                        multi_scale_loss += criterion(s_feat, t_feat)
-                        scale_count += 1
-
-                if scale_count > 0:
-                    multi_scale_loss /= scale_count
-                    # Weighted combination: more emphasis on final features
-                    loss = 0.7 * loss + 0.3 * multi_scale_loss
-
+            loss = criterion(s_features, t_features)
             if not assert_finite("loss", loss):
                 print("Skipping batch due to non-finite loss")
                 continue
 
+            # Normalize loss by accumulation steps
             loss = loss / accumulation_steps
             losses.update(loss.data.item() * accumulation_steps, data.size(0))
 
-            # Early stopping check for synthetic data
-            current_loss = losses.avg
-            if current_loss < best_loss:
-                best_loss = current_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= patience_limit:
-                print(
-                    f"\nEarly stopping at iteration {iter_nums}: no improvement for {patience_limit} iterations"
-                )
-                print(
-                    f"Best loss: {best_loss:.4f}, Current loss: {current_loss:.4f}"
-                )
-                finish = True
-                break
-
             try:
                 loss.backward()
-
+                
+                # Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(filter(
-                        lambda p: p.requires_grad, model.parameters()),
-                                                   max_norm=5.0)
+                    # gradient clipping
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
+                    )
                     optimizer.step()
                     optimizer.zero_grad()
-
-                    # Update EMA model (if available in parent scope)
-                    if 'ema_model' in dir():
-                        ema_model.update(model)
-
-                    # Learning rate scheduling
-                    if warmup_epochs > 0 and iter_nums <= warmup_epochs + start_epoch:
-                        lr = args.lr * (
-                            (iter_nums - start_epoch) / warmup_epochs)
+                    
+                    # Learning rate warmup and scheduling
+                    if warmup_epochs > 0 and iter_nums <= warmup_epochs:
+                        lr = args.lr * (iter_nums / warmup_epochs)
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr
-                    elif scheduler is not None and iter_nums > warmup_epochs + start_epoch:
+                    elif scheduler is not None and iter_nums > warmup_epochs:
                         scheduler.step()
             except Exception as e:
                 print("Backward/step failed:", e)
                 torch.cuda.empty_cache()
                 continue
-
+            # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
-
             if iter_nums % 50 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
-                print("Phase {phase} Train: [{0}/{1}]\t"
-                      "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                      "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                      "Loss {losses.val:.4f} ({losses.avg:.4f})\t"
-                      "LR {lr:.6f}".format(iter_nums - start_epoch,
-                                           max_iters,
-                                           batch_time=batch_time,
-                                           data_time=data_time,
-                                           losses=losses,
-                                           lr=current_lr,
-                                           phase=phase))
-
-
-def train(train_loader,
-          optimizer,
-          model,
-          origin_model,
-          args,
-          scheduler=None,
-          warmup_epochs=0):
-    """Wrapper for backward compatibility"""
-    train_progressive(train_loader,
-                      optimizer,
-                      model,
-                      origin_model,
-                      args,
-                      scheduler,
-                      warmup_epochs,
-                      max_epochs=args.epoch,
-                      phase=1,
-                      rm_blocks=[])
+                print(
+                    "Train: [{0}/{1}]\t"
+                    "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    "Loss {losses.val:.4f} ({losses.avg:.4f})\t"
+                    "LR {lr:.6f}".format(
+                        iter_nums,
+                        args.epoch,
+                        batch_time=batch_time,
+                        data_time=data_time,
+                        losses=losses,
+                        lr=current_lr,
+                    )
+                )
 
 
 # def Practise_recover(
@@ -1863,7 +1400,7 @@ def train(train_loader,
 def nmse_loss(p, z):
     p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)
     z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-    return torch.mean((p_norm - z_norm)**2)
+    return torch.mean((p_norm - z_norm) ** 2)
 
 
 def class_correlation_matrix(Z):
@@ -1891,10 +1428,10 @@ def train_clkd(
 
     # Adaptive loss weights with warmup
     warmup_epochs = int(0.1 * args.epoch)
-
+    
     # Temperature for knowledge distillation
     temperature = 4.0
-
+    
     def get_loss_weights(current_iter):
         if current_iter < warmup_epochs:
             alpha = current_iter / warmup_epochs
@@ -1931,8 +1468,7 @@ def train_clkd(
 
             # sanitize inputs
             if isinstance(data, torch.Tensor):
-                data = torch.nan_to_num(data, nan=0.0, posinf=1e6,
-                                        neginf=-1e6).cuda()
+                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
             else:
                 data = safe_to_device(data)
 
@@ -1944,9 +1480,7 @@ def train_clkd(
 
             # check teacher features
             if not assert_finite("t_features", t_features):
-                print(
-                    f"[batch {iter_nums}] skipping: teacher features non-finite"
-                )
+                print(f"[batch {iter_nums}] skipping: teacher features non-finite")
                 continue
 
             _, s_features = model(data)
@@ -1954,13 +1488,10 @@ def train_clkd(
 
             # Basic finiteness checks
             if not assert_finite("s_features", s_features):
-                print(
-                    f"[batch {iter_nums}] skipping: student features non-finite"
-                )
+                print(f"[batch {iter_nums}] skipping: student features non-finite")
                 continue
             if not assert_finite("s_logits", s_logits):
-                print(
-                    f"[batch {iter_nums}] skipping: student logits non-finite")
+                print(f"[batch {iter_nums}] skipping: student logits non-finite")
                 continue
 
             ce_loss = ce_criterion(s_logits, target)
@@ -1971,9 +1502,8 @@ def train_clkd(
             # Soft target KD loss with temperature scaling
             t_soft = F.softmax(t_logits / temperature, dim=1)
             s_soft = F.log_softmax(s_logits / temperature, dim=1)
-            kd_soft_loss = F.kl_div(s_soft, t_soft,
-                                    reduction='batchmean') * (temperature**2)
-
+            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
+            
             if not assert_finite("kd_soft_loss", kd_soft_loss):
                 print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
                 continue
@@ -1983,14 +1513,15 @@ def train_clkd(
                 l_cla = nmse_loss(s_features.T, t_features.T)
                 cc_s = class_correlation_matrix(s_features)
                 cc_t = class_correlation_matrix(t_features)
-                cc_loss = torch.mean((cc_s - cc_t)**2)
+                cc_loss = torch.mean((cc_s - cc_t) ** 2)
             else:
                 l_cla, cc_loss = compute_focused_class_losses(
-                    s_features, t_features, target, problematic_classes)
+                    s_features, t_features, target, problematic_classes
+                )
 
             # Get adaptive loss weights
             lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
-
+            
             kd_feature_loss = l_ins + l_cla
             total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
 
@@ -2004,19 +1535,16 @@ def train_clkd(
                 with torch.autograd.set_detect_anomaly(True):
                     total_loss.backward()
                 # gradient clipping
-                torch.nn.utils.clip_grad_norm_(filter(
-                    lambda p: p.requires_grad, model.parameters()),
-                                               max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
+                )
                 optimizer.step()
             except RuntimeError as e:
                 print(f"[batch {iter_nums}] backward failed: {e}")
                 # optionally save offending batch for inspection
                 try:
                     torch.save(
-                        {
-                            "data": data.detach().cpu(),
-                            "target": target.detach().cpu()
-                        },
+                        {"data": data.detach().cpu(), "target": target.detach().cpu()},
                         f"bad_batch_{iter_nums}.pt",
                     )
                     print(f"Saved bad batch bad_batch_{iter_nums}.pt")
@@ -2030,14 +1558,15 @@ def train_clkd(
             end = time.time()
 
             if iter_nums % 50 == 0:
-                print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                      f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                      f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                      f"Loss {losses.val:.4f} ({losses.avg:.4f})")
+                print(
+                    f"Train: [{iter_nums}/{args.epoch}]\t"
+                    f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    f"Loss {losses.val:.4f} ({losses.avg:.4f})"
+                )
 
 
-def compute_focused_class_losses(s_features, t_features, targets,
-                                 focused_classes):
+def compute_focused_class_losses(s_features, t_features, targets, focused_classes):
     """
     Compute class NMSE and correlation loss for selected classes only.
     """
@@ -2046,8 +1575,9 @@ def compute_focused_class_losses(s_features, t_features, targets,
     t_feat = t_features.view(t_features.size(0), -1).contiguous()
 
     # Mask for focused classes
-    mask = torch.tensor([c in focused_classes for c in targets.cpu().tolist()],
-                        device=targets.device)
+    mask = torch.tensor(
+        [c in focused_classes for c in targets.cpu().tolist()], device=targets.device
+    )
     if mask.sum() < 2:
         # Not enough samples in batch from focused classes, skip
         return 0.0, 0.0
@@ -2061,7 +1591,7 @@ def compute_focused_class_losses(s_features, t_features, targets,
     # Class correlation loss
     cc_s = class_correlation_matrix(s_selected)
     cc_t = class_correlation_matrix(t_selected)
-    cc_loss = torch.mean((cc_s - cc_t)**2)
+    cc_loss = torch.mean((cc_s - cc_t) ** 2)
 
     return class_nmse, cc_loss
 
@@ -2102,8 +1632,8 @@ def metric(metric_loader, model, origin_model, trained=False):
             loss = criterion(s_features, t_features)
 
             # Calculate overall accuracy
-            acc = accuracy(s_output, target, topk=(1, ))[0]
-            origin_acc = accuracy(t_output, target, topk=(1, ))[0]
+            acc = accuracy(s_output, target, topk=(1,))[0]
+            origin_acc = accuracy(t_output, target, topk=(1,))[0]
 
         losses.update(loss.data.item(), data.size(0))
         accuracies.update(acc.item(), data.size(0))
@@ -2125,7 +1655,8 @@ def metric(metric_loader, model, origin_model, trained=False):
                     data_time=data_time,
                     losses=losses,
                     accuracies=accuracies,
-                ))
+                )
+            )
 
     print(" * Metric Loss {loss.avg:.4f}".format(loss=losses))
 
@@ -2137,8 +1668,9 @@ def metric(metric_loader, model, origin_model, trained=False):
     return losses.avg, accuracies.avg, origin_accuracies.avg, problematic_classes
 
 
-def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
-                  args, target_classes):
+def train_focused(
+    train_loader, metric_loader, optimizer, model, origin_model, args, target_classes
+):
     """
     Train the model focusing on specific classes with large accuracy differences
     """
@@ -2170,8 +1702,9 @@ def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
                 break
 
             # Filter data for target classes
-            mask = torch.tensor([t in target_classes for t in target],
-                                device=data.device)
+            mask = torch.tensor(
+                [t in target_classes for t in target], device=data.device
+            )
             if not mask.any():
                 continue
 
@@ -2200,16 +1733,18 @@ def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
             optimizer.step()
 
             if iter_nums % 50 == 0:
-                print("Focused Train: [{0}/{1}]\t"
-                      "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                      "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                      "Loss {losses.val:.4f} ({losses.avg:.4f})".format(
-                          iter_nums,
-                          args.epoch,
-                          batch_time=batch_time,
-                          data_time=data_time,
-                          losses=losses,
-                      ))
+                print(
+                    "Focused Train: [{0}/{1}]\t"
+                    "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    "Loss {losses.val:.4f} ({losses.avg:.4f})".format(
+                        iter_nums,
+                        args.epoch,
+                        batch_time=batch_time,
+                        data_time=data_time,
+                        losses=losses,
+                    )
+                )
 
             if iter_nums % 400 == 0:
                 _, acc, _, _ = metric(metric_loader, model, origin_model)
@@ -2219,9 +1754,7 @@ def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
     return model
 
 
-def log_model_parameters(model,
-                         model_name="Model",
-                         log_file="model_parameters.log"):
+def log_model_parameters(model, model_name="Model", log_file="model_parameters.log"):
     # Check for existing files and increment the file name if necessary
     base_name, ext = os.path.splitext(log_file)
     counter = 1
@@ -2230,10 +1763,9 @@ def log_model_parameters(model,
         counter += 1
 
     # Set PyTorch print options to display all elements
-    torch.set_printoptions(edgeitems=None,
-                           linewidth=1000,
-                           sci_mode=False,
-                           threshold=float("inf"))
+    torch.set_printoptions(
+        edgeitems=None, linewidth=1000, sci_mode=False, threshold=float("inf")
+    )
 
     with open(log_file, "a") as f:  # Open the log file in append mode
         f.write(f"Parameters of {model_name}:\n")
@@ -2246,10 +1778,7 @@ def log_model_parameters(model,
         f.write(f"Total Parameters in {model_name}: {total_params}\n\n")
 
     # Optionally, reset print options to default after logging
-    torch.set_printoptions(edgeitems=3,
-                           linewidth=80,
-                           sci_mode=None,
-                           threshold=1000)
+    torch.set_printoptions(edgeitems=3, linewidth=80, sci_mode=None, threshold=1000)
 
     print(f"Parameters logged in {log_file}")
 
@@ -2279,8 +1808,7 @@ def example_batchnorm_gamma_analysis(model):
 
     # Method 4: Create visualizations
     print("\n4. Creating visualizations...")
-    analysis_results = analyze_batchnorm_gamma_distribution(model,
-                                                            save_plot=True)
+    analysis_results = analyze_batchnorm_gamma_distribution(model, save_plot=True)
 
     # Method 5: Access specific layer gamma values
     print("\n5. Accessing specific layer gamma values...")
@@ -2296,10 +1824,9 @@ def example_batchnorm_gamma_analysis(model):
     return gamma_values, analysis_results
 
 
-def measure_taylor_saliency_per_block(model,
-                                      data_loader,
-                                      num_batches=10,
-                                      device="cuda"):
+def measure_taylor_saliency_per_block(
+    model, data_loader, num_batches=10, device="cuda"
+):
     """
     Compute Taylor expansion-based saliency score per residual block.
 

@@ -282,4 +282,6 @@ def fakedata(num_sample=400, sub_idx=None, batch_size=64):
 
 if __name__ == '__main__':
     import IPython
+
     IPython.embed()
+

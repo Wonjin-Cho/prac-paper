@@ -16,6 +16,39 @@ import torch.nn.functional as F
 import numpy as np
 
 
+class ChannelAttention(nn.Module):
+    """Channel attention module"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention module"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        return self.sigmoid(self.conv(x))
+
+
 class MultiScaleFeatureMatcher(nn.Module):
     """Match features at multiple scales using learnable projections"""
     
@@ -23,6 +56,8 @@ class MultiScaleFeatureMatcher(nn.Module):
         super().__init__()
         self.num_scales = num_scales
         self.projections = nn.ModuleList()
+        self.channel_attentions = nn.ModuleList()
+        self.spatial_attentions = nn.ModuleList()
         
         for i in range(num_scales):
             # Learnable projection to align teacher and student features
@@ -33,6 +68,9 @@ class MultiScaleFeatureMatcher(nn.Module):
                     nn.ReLU(inplace=True)
                 )
             )
+            # Attention modules
+            self.channel_attentions.append(ChannelAttention(teacher_channels[i]))
+            self.spatial_attentions.append(SpatialAttention())
     
     def forward(self, student_features, teacher_features):
         """
@@ -41,17 +79,23 @@ class MultiScaleFeatureMatcher(nn.Module):
             teacher_features: List of feature maps from teacher [layer1, layer2, layer3]
         """
         total_loss = 0
-        for i, (s_feat, t_feat, proj) in enumerate(zip(
-            student_features, teacher_features, self.projections
+        for i, (s_feat, t_feat, proj, ch_att, sp_att) in enumerate(zip(
+            student_features, teacher_features, self.projections,
+            self.channel_attentions, self.spatial_attentions
         )):
             # Project student features
             s_aligned = proj(s_feat)
             
-            # Multi-scale matching with spatial attention
-            attention = self._compute_spatial_attention(t_feat)
+            # Apply channel and spatial attention
+            channel_weight = ch_att(t_feat)
+            spatial_weight = sp_att(t_feat)
+            
+            # Combined attention-weighted features
+            t_weighted = t_feat * channel_weight * spatial_weight
+            s_weighted = s_aligned * channel_weight * spatial_weight
             
             # Weighted MSE loss
-            loss = F.mse_loss(s_aligned * attention, t_feat * attention)
+            loss = F.mse_loss(s_weighted, t_weighted)
             total_loss += loss * (2 ** i)  # Weight later layers more
         
         return total_loss / len(student_features)
@@ -103,6 +147,87 @@ class ContrastiveLoss(nn.Module):
         logits_mask = torch.scatter(
             torch.ones_like(mask),
             1,
+
+
+class RelationalKD(nn.Module):
+    """Relational Knowledge Distillation - preserves pairwise relationships"""
+    
+    def __init__(self, temperature=1.0):
+        super().__init__()
+        self.temperature = temperature
+    
+    def forward(self, student_features, teacher_features):
+        """
+        Args:
+            student_features: (batch, channels, h, w)
+            teacher_features: (batch, channels, h, w)
+        """
+        # Flatten spatial dimensions
+        s_feat = student_features.flatten(2)  # (batch, channels, h*w)
+        t_feat = teacher_features.flatten(2)
+        
+        # Compute pairwise similarity matrices
+        s_sim = torch.bmm(s_feat.transpose(1, 2), s_feat) / self.temperature  # (batch, h*w, h*w)
+        t_sim = torch.bmm(t_feat.transpose(1, 2), t_feat) / self.temperature
+        
+        # Normalize
+        s_sim = F.normalize(s_sim, dim=-1)
+        t_sim = F.normalize(t_sim, dim=-1)
+        
+        # Huber loss for robustness
+        loss = F.smooth_l1_loss(s_sim, t_sim)
+        return loss
+
+
+class CurriculumWeighting(nn.Module):
+    """Dynamic loss weighting based on training progress"""
+    
+    def __init__(self, num_components=5, warmup_epochs=10, total_epochs=100):
+        super().__init__()
+        self.num_components = num_components
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.current_epoch = 0
+    
+    def get_weights(self, epoch=None):
+        """Get dynamic weights based on epoch"""
+        if epoch is not None:
+            self.current_epoch = epoch
+        
+        progress = min(self.current_epoch / self.total_epochs, 1.0)
+        
+        # Start with task loss, gradually add distillation losses
+        if progress < self.warmup_epochs / self.total_epochs:
+            # Warm-up: focus on simple feature matching
+            weights = {
+                'ms_loss': 1.0,
+                'contrast': 0.0,
+                'hier': 0.0,
+                'aux': 0.0,
+                'kd': 0.0
+            }
+        elif progress < 0.5:
+            # Early training: add contrastive and hierarchical
+            weights = {
+                'ms_loss': 1.0,
+                'contrast': progress * 2,
+                'hier': progress * 1.5,
+                'aux': 0.0,
+                'kd': 0.5
+            }
+        else:
+            # Late training: all components active
+            weights = {
+                'ms_loss': 1.0,
+                'contrast': 0.5,
+                'hier': 0.3,
+                'aux': 0.1 * (progress - 0.5) * 2,
+                'kd': 1.0
+            }
+        
+        return weights
+
+
             torch.arange(batch_size).view(-1, 1).to(mask.device),
             0
         )
@@ -224,7 +349,7 @@ class SelfSupervisedAuxTask(nn.Module):
 class AMFRCRLoss(nn.Module):
     """Complete AMFR-CR loss combining all components"""
     
-    def __init__(self, teacher_channels, student_channels, feature_dim):
+    def __init__(self, teacher_channels, student_channels, feature_dim, use_curriculum=True):
         super().__init__()
         
         # Components
@@ -233,21 +358,41 @@ class AMFRCRLoss(nn.Module):
         self.block_weighting = AdaptiveBlockWeighting(num_blocks=len(student_channels))
         self.hierarchical_kd = HierarchicalKnowledgeTransfer(teacher_channels, student_channels)
         self.aux_task = SelfSupervisedAuxTask(feature_dim)
+        self.relational_kd = RelationalKD(temperature=1.0)
         
-        # Loss weights
+        # Curriculum learning
+        self.use_curriculum = use_curriculum
+        if use_curriculum:
+            self.curriculum = CurriculumWeighting()
+        
+        # Loss weights (will be adjusted by curriculum if enabled)
         self.alpha_ms = 1.0  # Multi-scale feature matching
         self.alpha_contrast = 0.5  # Contrastive loss
         self.alpha_hier = 0.3  # Hierarchical KD
         self.alpha_aux = 0.1  # Auxiliary task
+        self.alpha_relational = 0.2  # Relational KD
     
-    def forward(self, student_outputs, teacher_outputs, labels, images):
+    def forward(self, student_outputs, teacher_outputs, labels, images, epoch=None):
         """
         Args:
             student_outputs: Dict with 'features' (list), 'logits', 'final_features'
             teacher_outputs: Dict with 'features' (list), 'logits', 'final_features'
             labels: Ground truth labels
             images: Input images
+            epoch: Current training epoch (for curriculum learning)
         """
+        # Get dynamic weights if using curriculum
+        if self.use_curriculum and epoch is not None:
+            weights = self.curriculum.get_weights(epoch)
+        else:
+            weights = {
+                'ms_loss': self.alpha_ms,
+                'contrast': self.alpha_contrast,
+                'hier': self.alpha_hier,
+                'aux': self.alpha_aux,
+                'kd': 1.0
+            }
+        
         # 1. Multi-scale feature matching
         ms_loss = self.ms_matcher(
             student_outputs['features'],
@@ -273,7 +418,13 @@ class AMFRCRLoss(nn.Module):
             images
         )
         
-        # 5. Standard KD loss on logits
+        # 5. Relational knowledge distillation on middle features
+        relational_loss = sum([
+            self.relational_kd(s_feat, t_feat)
+            for s_feat, t_feat in zip(student_outputs['features'], teacher_outputs['features'])
+        ]) / len(student_outputs['features'])
+        
+        # 6. Standard KD loss on logits
         T = 4.0
         kd_loss = F.kl_div(
             F.log_softmax(student_outputs['logits'] / T, dim=1),
@@ -281,13 +432,14 @@ class AMFRCRLoss(nn.Module):
             reduction='batchmean'
         ) * (T * T)
         
-        # Combine all losses
+        # Combine all losses with dynamic weights
         total_loss = (
-            self.alpha_ms * ms_loss +
-            self.alpha_contrast * contrast_loss +
-            self.alpha_hier * hier_loss +
-            self.alpha_aux * aux_loss +
-            kd_loss
+            weights['ms_loss'] * ms_loss +
+            weights['contrast'] * contrast_loss +
+            weights['hier'] * hier_loss +
+            weights['aux'] * aux_loss +
+            self.alpha_relational * relational_loss +
+            weights['kd'] * kd_loss
         )
         
         return {
@@ -296,6 +448,7 @@ class AMFRCRLoss(nn.Module):
             'contrast_loss': contrast_loss.item(),
             'hier_loss': hier_loss.item(),
             'aux_loss': aux_loss.item(),
+            'relational_loss': relational_loss.item(),
             'kd_loss': kd_loss.item()
         }
 

@@ -1,4 +1,3 @@
-
 import os
 import gc
 import argparse
@@ -39,12 +38,12 @@ class ModelEMA:
         self.module = copy.deepcopy(model)
         self.module.eval()
         self.decay = decay
-        
+
     def update(self, model):
         with torch.no_grad():
             for ema_param, model_param in zip(self.module.parameters(), model.parameters()):
                 ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1 - self.decay)
-                
+
     def state_dict(self):
         return self.module.state_dict()
 
@@ -895,12 +894,10 @@ def Practise_all_blocks(
 #         cuda=args.cuda,
 #     )
 
-#     # example_batchnorm_gamma_analysis(origin_model)
-#     # recoverability,acc,origin_acc,problematic_classes = metric(metric_loader, pruned_model, origin_model, trained=True)
-#     # recoverability,pruned_acc,origin_acc,problematic_classes = metric(metric_loader, pruned_model, origin_model, trained=False)
-#     pruned_acc = 0
+#     # print("Metric w/o Recovering:")
+#     # metric(metric_loader, pruned_model, origin_model)
+
 #     pruned_model_adaptor = AdaptorWarp(pruned_model)
-#     # pruned_model_adaptor = BlockReinitWarp(pruned_model)
 
 #     start_time = time.time()
 #     pruned_acc1 = Practise_recover(
@@ -1004,13 +1001,6 @@ def Practise_all_blocks(
 #     #     args.model, drop_blocks, args.num_classes,
 #     #     state_dict_path=args.state_dict_path, teacher=args.teacher, cuda=args.cuda
 #     # )
-#     # drop_blocks = []
-#     # if args.rm_blocks.isdigit():
-#     #     print(int(args.rm_blocks))
-#     #     print(sort_list[0])
-#     #     for i in range(int(args.rm_blocks)):
-#     #         print(sort_list[i][1]) #.remove(drop_blocks)
-#     #         drop_blocks.append(sort_list[i][1])
 #     # lat_reduction = (origin_lat - pruned_lat) / origin_lat * 100
 #     # print(f'=> latency reduction: {lat_reduction:.2f}%')
 #     # recoverability,acc,_,_ = metric(metric_loader, pruned_model, origin_model, trained=False)
@@ -1130,7 +1120,7 @@ def insert_all_adaptors_for_resnet(origin_model, prune_model, rm_blocks, params,
         rm_count[l_id - 1] += 1
         rm_block_prune = f"{layer}.{prune_b_id}"
         rm_blocks_for_prune.append(rm_block_prune)
-    
+
     # Add layer-wise learning rates for adaptors
     for rm_block in rm_blocks_for_prune:
         layer_num = int(rm_block.split('.')[0][-1])
@@ -1279,7 +1269,6 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
                 print("Skipping batch due to non-finite teacher features")
                 continue
 
-            optimizer.zero_grad()
             output, s_features = model(data)
 
             # check student features
@@ -1298,7 +1287,7 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
 
             try:
                 loss.backward()
-                
+
                 # Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % accumulation_steps == 0:
                     # gradient clipping
@@ -1307,7 +1296,7 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
                     )
                     optimizer.step()
                     optimizer.zero_grad()
-                    
+
                     # Learning rate warmup and scheduling
                     if warmup_epochs > 0 and iter_nums <= warmup_epochs:
                         lr = args.lr * (iter_nums / warmup_epochs)
@@ -1428,10 +1417,10 @@ def train_clkd(
 
     # Adaptive loss weights with warmup
     warmup_epochs = int(0.1 * args.epoch)
-    
+
     # Temperature for knowledge distillation
     temperature = 4.0
-    
+
     def get_loss_weights(current_iter):
         if current_iter < warmup_epochs:
             alpha = current_iter / warmup_epochs
@@ -1476,17 +1465,15 @@ def train_clkd(
             data_time.update(time.time() - end)
 
             with torch.no_grad():
-                _, t_features = origin_model(data)
+                t_logits, t_features = origin_model(data)
 
             # check teacher features
             if not assert_finite("t_features", t_features):
                 print(f"[batch {iter_nums}] skipping: teacher features non-finite")
                 continue
 
-            _, s_features = model(data)
-            s_logits, _ = model(data)
-
-            # Basic finiteness checks
+            s_logits, s_features = model(data)
+            # check student features
             if not assert_finite("s_features", s_features):
                 print(f"[batch {iter_nums}] skipping: student features non-finite")
                 continue
@@ -1503,7 +1490,7 @@ def train_clkd(
             t_soft = F.softmax(t_logits / temperature, dim=1)
             s_soft = F.log_softmax(s_logits / temperature, dim=1)
             kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
-            
+
             if not assert_finite("kd_soft_loss", kd_soft_loss):
                 print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
                 continue
@@ -1521,7 +1508,7 @@ def train_clkd(
 
             # Get adaptive loss weights
             lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
-            
+
             kd_feature_loss = l_ins + l_cla
             total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
 

@@ -176,14 +176,14 @@ def train_distill(epoch, train_loader, module_list, optimizer, opt, problematic_
     # set modules as train()
     for module in module_list:
         module.cuda()
-        module.eval()
+        module.train()  # Changed to train mode for better learning
         module.get_feat = 'pre_GAP'
     # set teacher as eval()
     module_list[-1].eval()
 
-    # Use MSE loss like practise.py
-    alpha = 0.5
-    gamma = 0.5
+    # Stronger distillation weights for multi-block pruning
+    alpha = 0.7  # Increased KD weight
+    gamma = 0.3  # Decreased classification weight
     criterion_kd = MIXSTDLoss(opt, alpha, gamma)
     # criterion = torch.nn.MSELoss(reduction='mean')
 
@@ -286,7 +286,7 @@ def train_distill(epoch, train_loader, module_list, optimizer, opt, problematic_
                 sys.stdout.flush()
 
     print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-          .format(top1=top1, top5=top5))
+            .format(top1=top1, top5=top5))
     
     all_inputs = torch.cat(synthetic_inputs_list, dim=0)
     all_targets = torch.cat(synthetic_targets_list, dim=0)
@@ -346,4 +346,3 @@ def validate(val_loader, model, criterion, opt):
               .format(top1=top1, top5=top5))
 
     return top1.avg, top5.avg, losses.avg
-

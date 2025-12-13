@@ -180,9 +180,9 @@ def main():
     # python main.py --num_sample 500 --seed 2021 --epoch 100 --practise one --rm_blocks layer1.1 --gpu_id 0
     args.num_sample = 1280
     args.seed = 2021
-    args.epoch = 1200  # Further increased for better convergence
+    args.epoch = 2000  # Significantly increased for 3-block pruning
     args.state_dict_path = ""
-    args.lr = 0.015  # Slightly lower initial LR
+    args.lr = 0.02  # Restore higher initial LR for faster initial learning
     args.practise = "all"
     args.rm_blocks = "1"
     args.gpu_id = "0"

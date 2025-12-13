@@ -424,15 +424,10 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     # Select training method based on args
     if hasattr(args, 'use_msfam') and args.use_msfam:
         print("Using Enhanced MSFAM method (Multi-Scale Feature Alignment with Adaptive Mixup)")
-        from novel_method import train_with_msfam
+        from novel_method import SimplifiedMSFAMTrainer
         
-        # Create discriminator optimizer
-        trainer = MSFAMTrainer(prune_model, origin_model)
-        disc_optimizer = torch.optim.Adam(
-            trainer.discriminator.parameters(),
-            lr=0.0001,
-            betas=(0.5, 0.999)
-        )
+        # Create trainer with rm_blocks info
+        trainer = SimplifiedMSFAMTrainer(prune_model, origin_model, rm_blocks=rm_blocks, num_classes=args.num_classes)
         
         # Training loop
         iter_nums = 0
@@ -445,8 +440,8 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     break
                 
                 losses = trainer.train_step(
-                    data, target, optimizer, disc_optimizer,
-                    iter_nums, args.epoch, use_mixup=True
+                    data, target, optimizer,
+                    iter_nums, args.epoch
                 )
                 
                 # Clear cache to reduce memory usage
@@ -456,8 +451,8 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                 if iter_nums % 50 == 0:
                     print(f"Train: [{iter_nums}/{args.epoch}]\t"
                           f"Total Loss {losses['total_loss']:.4f}\t"
-                          f"KD Loss {losses['kd_loss']:.4f}\t"
                           f"CE Loss {losses['ce_loss']:.4f}\t"
+                          f"KD Loss {losses['kd_loss']:.4f}\t"
                           f"Feature Loss {losses['feat_loss']:.4f}")
         
         trainer.cleanup()

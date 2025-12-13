@@ -1211,7 +1211,11 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     recover_time = time.time()
 
     # Select training method based on args
-    if hasattr(args, 'training_method'):
+    if hasattr(args, 'use_msfam') and args.use_msfam:
+        print("Using Enhanced MSFAM method (Multi-Scale Feature Alignment with Adaptive Mixup)")
+        from novel_method import train_with_msfam
+        reinit_model = train_with_msfam(reinit_model, origin_model, train_loader, epochs=args.epoch, lr=args.lr)
+    elif hasattr(args, 'training_method'):
         if args.training_method == 'alkd':
             print("Using ALKD-CR method (Adaptive Layer-wise KD with Channel Recalibration)")
             from novel_method_alkd import ALKDCRTrainer

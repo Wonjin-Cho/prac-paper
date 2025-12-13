@@ -363,8 +363,7 @@ def analyze_channel_similarities(model, layer_names):
         max_sim_idx = np.unravel_index(np.argmax(similarity_np),
                                        similarity_np.shape)
         print(
-            f"Most similar channels: {max_sim_idx} with similarity {similarity_np[max_sim_idx]:.4f}"
-        )
+            f"Most similar channels: {max_sim_idx} with similarity {similarity_np[max_sim_idx]:.4f}")
 
         # Store results
         results[layer_name] = {
@@ -1317,6 +1316,10 @@ def train_progressive(train_loader,
         student_channels=student_channels,
         feature_dim=feature_dim)
 
+    # Move criterion to device if using CUDA
+    if args.cuda:
+        amfr_criterion = amfr_criterion.cuda()
+
     # Curriculum learning: Start with easier examples, gradually increase difficulty
     if is_aggressive_pruning and phase == 1:
         print("🎓 Curriculum Learning: Starting with easier samples")
@@ -1578,13 +1581,12 @@ def train_clkd(
     # Extract features from pre-GAP layer
     model.get_feat = "pre_GAP"
     origin_model.get_feat = "pre_GAP"
-
-    if args.cuda:
-        model.cuda()
-    model.train()
-    if args.cuda:
-        origin_model.cuda()
+    device = torch.device("cuda" if args.cuda else "cpu")
+    model.to(device)
+    origin_model.to(device)
     origin_model.eval()
+
+    model.train()
 
     iter_nums = 0
     finish = False
@@ -1601,20 +1603,10 @@ def train_clkd(
 
             # sanitize inputs
             if isinstance(data, torch.Tensor):
-                if args.cuda:
-                    data = torch.nan_to_num(data,
-                                            nan=0.0,
-                                            posinf=1e6,
-                                            neginf=-1e6).cuda()
-                else:
-                    data = torch.nan_to_num(data,
-                                            nan=0.0,
-                                            posinf=1e6,
-                                            neginf=-1e6)
+                data = data.to(device)
             else:
-                data = safe_to_device(data)
-            if args.cuda:
-                target = target.cuda()
+                data = safe_to_device(data, device)
+            target = target.to(device)
             data_time.update(time.time() - end)
 
             with torch.no_grad():
@@ -1749,17 +1741,14 @@ def metric(args, metric_loader, model, origin_model, trained=False):
     criterion = torch.nn.MSELoss(reduction="mean")
 
     # switch to train mode
-    if args.cuda:
-        origin_model.cuda()
-        model.cuda()
-    else:
-        origin_model.cpu()
-        model.cpu()
+    device = torch.device("cuda" if args.cuda else "cpu")
+    origin_model.to(device)
+    model.to(device)
     origin_model.eval()
-    origin_model.get_feat = "pre_GAP"
 
     model.eval()
     model.get_feat = "pre_GAP"
+    origin_model.get_feat = "pre_GAP"
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -1779,12 +1768,8 @@ def metric(args, metric_loader, model, origin_model, trained=False):
     end = time.time()
     for i, (data, target) in enumerate(metric_loader):
         with torch.no_grad():
-            if args.cuda:
-                data = data.cuda()
-                target = target.cuda()
-            else:
-                data = data.cpu()
-                target = target.cpu()
+            data = data.to(device)
+            target = target.to(device)
             data_time.update(time.time() - end)
             t_output, t_features = origin_model(data)
             s_output, s_features = model(data)
@@ -1835,12 +1820,9 @@ def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
     cls_criterion = torch.nn.CrossEntropyLoss()
 
     # switch to train mode
-    if args.cuda:
-        origin_model.cuda()
-        model.cuda()
-    else:
-        origin_model.cpu()
-        model.cpu()
+    device = torch.device("cuda" if args.cuda else "cpu")
+    origin_model.to(device)
+    model.to(device)
 
     origin_model.eval()
 
@@ -1869,12 +1851,8 @@ def train_focused(train_loader, metric_loader, optimizer, model, origin_model,
                                 device=data.device)
             if not mask.any():
                 continue
-            if args.cuda:
-                data = data[mask].cuda()
-                target = target[mask].cuda()
-            else:
-                data = data[mask].cpu()
-                target = target[mask].cpu()
+            data = data[mask].to(device)
+            target = target[mask].to(device)
 
             with torch.no_grad():
                 t_logits, t_features = origin_model(data)

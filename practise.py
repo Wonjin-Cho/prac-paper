@@ -1337,8 +1337,7 @@ def train_progressive(train_loader,
     dgkd_criterion = DGKDLoss(
         teacher_channels=teacher_channels[:3],
         student_channels=student_channels,
-        feature_dim=512,
-        # Add other DGKD specific parameters if needed
+        num_epochs=args.epochs
     )
 
 

@@ -7,7 +7,7 @@ from scipy.stats import wasserstein_distance
 
 
 class MultiScaleFeatureExtractor(nn.Module):
-    """Extract features at multiple scales from the model"""
+    """Extract features at multiple scales including residuals"""
     def __init__(self, model, layer_names):
         super().__init__()
         self.model = model
@@ -35,135 +35,275 @@ class MultiScaleFeatureExtractor(nn.Module):
             hook.remove()
 
 
-class WassersteinFeatureLoss(nn.Module):
-    """Wasserstein distance-based feature alignment"""
-    def __init__(self, num_samples=100):
+class SlicedWassersteinLoss(nn.Module):
+    """Efficient differentiable approximation of Wasserstein distance"""
+    def __init__(self, num_projections=50):
         super().__init__()
-        self.num_samples = num_samples
+        self.num_projections = num_projections
     
     def forward(self, student_feat, teacher_feat):
         # Flatten spatial dimensions
         bs, c, h, w = student_feat.shape
-        student_flat = student_feat.view(bs, c, -1)
-        teacher_flat = teacher_feat.view(bs, c, -1)
+        student_flat = student_feat.view(bs, c, -1).transpose(1, 2)  # [bs, hw, c]
+        teacher_flat = teacher_flat.view(bs, c, -1).transpose(1, 2)
         
-        # Compute channel-wise Wasserstein distance
-        loss = 0
-        for i in range(min(c, self.num_samples)):
-            s_dist = student_flat[:, i, :].flatten().detach().cpu().numpy()
-            t_dist = teacher_flat[:, i, :].flatten().detach().cpu().numpy()
-            
-            # Sample for efficiency
-            if len(s_dist) > 1000:
-                indices = np.random.choice(len(s_dist), 1000, replace=False)
-                s_dist = s_dist[indices]
-                t_dist = t_dist[indices]
-            
-            loss += wasserstein_distance(s_dist, t_dist)
+        # Random projections
+        device = student_feat.device
+        projections = torch.randn(c, self.num_projections, device=device)
+        projections = F.normalize(projections, dim=0)
         
-        return torch.tensor(loss / min(c, self.num_samples), device=student_feat.device)
+        # Project features
+        student_proj = torch.matmul(student_flat, projections)  # [bs, hw, num_proj]
+        teacher_proj = torch.matmul(teacher_flat, projections)
+        
+        # Sort and compute L2 distance (differentiable Wasserstein approximation)
+        student_sorted, _ = torch.sort(student_proj, dim=1)
+        teacher_sorted, _ = torch.sort(teacher_proj, dim=1)
+        
+        loss = F.mse_loss(student_sorted, teacher_sorted)
+        return loss
 
 
 class AdaptiveUncertaintyMixup:
-    """Mixup based on feature uncertainty from teacher model"""
+    """Mixup with curriculum-based uncertainty weighting"""
     def __init__(self, teacher_model, alpha=1.0):
         self.teacher_model = teacher_model
         self.alpha = alpha
+        self.uncertainty_ema = None
+        self.ema_decay = 0.9
     
     def compute_uncertainty(self, images):
-        """Compute prediction uncertainty using entropy"""
+        """Compute prediction uncertainty using entropy and confidence"""
         with torch.no_grad():
             output = self.teacher_model(images)
-            # Handle both single output and tuple (logits, features)
             if isinstance(output, tuple):
                 logits = output[0]
             else:
                 logits = output
             probs = F.softmax(logits, dim=1)
+            
+            # Combine entropy and max confidence
             entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
-        return entropy
+            max_conf = torch.max(probs, dim=1)[0]
+            uncertainty = entropy * (1 - max_conf)
+            
+        return uncertainty
     
-    def __call__(self, images, labels):
+    def __call__(self, images, labels, epoch_progress=0.0):
         batch_size = images.size(0)
         
-        # Compute uncertainty for each sample
+        # Compute uncertainty
         uncertainty = self.compute_uncertainty(images)
         
-        # Generate mixup weights based on uncertainty
-        # High uncertainty samples get lower mixing weights
-        weights = torch.softmax(-uncertainty, dim=0)
+        # Update EMA
+        if self.uncertainty_ema is None:
+            self.uncertainty_ema = uncertainty.mean()
+        else:
+            self.uncertainty_ema = self.ema_decay * self.uncertainty_ema + (1 - self.ema_decay) * uncertainty.mean()
         
-        # Create mixup pairs based on uncertainty
+        # Adaptive mixing based on curriculum
+        # Early training: more mixing, late training: less mixing
+        alpha_schedule = self.alpha * (1.0 - 0.5 * epoch_progress)
+        
         indices = torch.randperm(batch_size)
         mixed_images = images.clone()
         mixed_labels = labels.clone()
         
         for i in range(batch_size):
-            # Lambda from beta distribution, modulated by uncertainty
-            lam = np.random.beta(self.alpha, self.alpha)
-            lam = lam * (1 - weights[i].item())  # Reduce mixing for uncertain samples
+            # Higher uncertainty = more conservative mixing
+            lam = np.random.beta(alpha_schedule, alpha_schedule)
+            uncertainty_factor = torch.sigmoid((uncertainty[i] - self.uncertainty_ema) / 0.1).item()
+            lam = lam * (1 - 0.3 * uncertainty_factor)
             
             mixed_images[i] = lam * images[i] + (1 - lam) * images[indices[i]]
-            mixed_labels[i] = lam * labels[i] + (1 - lam) * labels[indices[i]]
+            
+            # Soft labels for mixup
+            if len(labels.shape) == 1:  # Hard labels
+                soft_label = torch.zeros(labels.max() + 1, device=labels.device)
+                soft_label[labels[i]] = lam
+                soft_label[labels[indices[i]]] += (1 - lam)
+                mixed_labels[i] = soft_label
         
         return mixed_images, mixed_labels
 
 
-class ContrastiveLearningHead(nn.Module):
-    """Self-supervised contrastive learning head for better representation"""
-    def __init__(self, feature_dim=512, projection_dim=128):
+class MomentumContrastiveHead(nn.Module):
+    """Contrastive head with momentum encoder and hard negative mining"""
+    def __init__(self, feature_dim=512, projection_dim=128, momentum=0.999, queue_size=4096):
         super().__init__()
-        self.projection = nn.Sequential(
+        self.momentum = momentum
+        self.queue_size = queue_size
+        
+        # Query encoder (trainable)
+        self.query_proj = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feature_dim, projection_dim)
         )
+        
+        # Key encoder (momentum updated)
+        self.key_proj = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(feature_dim, projection_dim)
+        )
+        
+        # Copy weights
+        for param_q, param_k in zip(self.query_proj.parameters(), self.key_proj.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+        
+        # Queue for negative samples
+        self.register_buffer("queue", torch.randn(projection_dim, queue_size))
+        self.queue = F.normalize(self.queue, dim=0)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
     
-    def forward(self, features):
-        # Global average pooling if needed
-        if len(features.shape) == 4:
-            features = F.adaptive_avg_pool2d(features, (1, 1))
-            features = features.view(features.size(0), -1)
-        return F.normalize(self.projection(features), dim=1)
+    @torch.no_grad()
+    def _momentum_update(self):
+        """Momentum update of key encoder"""
+        for param_q, param_k in zip(self.query_proj.parameters(), self.key_proj.parameters()):
+            param_k.data = param_k.data * self.momentum + param_q.data * (1. - self.momentum)
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys):
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptr)
+        
+        # Replace oldest entries
+        if ptr + batch_size <= self.queue_size:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+        else:
+            remaining = self.queue_size - ptr
+            self.queue[:, ptr:] = keys[:remaining].T
+            self.queue[:, :batch_size - remaining] = keys[remaining:].T
+        
+        ptr = (ptr + batch_size) % self.queue_size
+        self.queue_ptr[0] = ptr
+    
+    def forward(self, query_feat, key_feat, temperature=0.07, use_hard_negatives=True):
+        # Pool if needed
+        if len(query_feat.shape) == 4:
+            query_feat = F.adaptive_avg_pool2d(query_feat, (1, 1)).view(query_feat.size(0), -1)
+            key_feat = F.adaptive_avg_pool2d(key_feat, (1, 1)).view(key_feat.size(0), -1)
+        
+        # Normalize
+        q = F.normalize(self.query_proj(query_feat), dim=1)
+        
+        with torch.no_grad():
+            self._momentum_update()
+            k = F.normalize(self.key_proj(key_feat), dim=1)
+        
+        # Positive logits
+        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+        
+        # Negative logits from queue
+        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+        
+        # Hard negative mining
+        if use_hard_negatives:
+            # Select top-k hardest negatives
+            k_hard = min(512, l_neg.size(1))
+            hard_neg_logits, _ = torch.topk(l_neg, k_hard, dim=1)
+            logits = torch.cat([l_pos, hard_neg_logits], dim=1)
+        else:
+            logits = torch.cat([l_pos, l_neg], dim=1)
+        
+        logits /= temperature
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=q.device)
+        
+        # Update queue
+        self._dequeue_and_enqueue(k)
+        
+        return F.cross_entropy(logits, labels)
 
 
-class FeatureDiscriminator(nn.Module):
-    """Discriminator for adversarial feature alignment"""
+class SpectralNormDiscriminator(nn.Module):
+    """Multi-scale discriminator with spectral normalization"""
     def __init__(self, feature_dim=512):
         super().__init__()
-        self.discriminator = nn.Sequential(
-            nn.Linear(feature_dim, 256),
+        
+        # Spatial discriminator (preserves spatial structure)
+        self.spatial_disc = nn.Sequential(
+            nn.utils.spectral_norm(nn.Conv2d(feature_dim, 256, 3, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(256, 128),
+            nn.utils.spectral_norm(nn.Conv2d(256, 128, 3, stride=2, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(128, 1)
+            nn.utils.spectral_norm(nn.Conv2d(128, 64, 3, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.utils.spectral_norm(nn.Linear(64, 1))
+        )
+        
+        # Global discriminator
+        self.global_disc = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(feature_dim, 256)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Linear(256, 128)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.utils.spectral_norm(nn.Linear(128, 1))
         )
     
     def forward(self, features):
         if len(features.shape) == 4:
-            features = F.adaptive_avg_pool2d(features, (1, 1))
-            features = features.view(features.size(0), -1)
-        return self.discriminator(features)
+            # Spatial discrimination
+            spatial_score = self.spatial_disc(features)
+            
+            # Global discrimination
+            global_feat = F.adaptive_avg_pool2d(features, (1, 1)).view(features.size(0), -1)
+            global_score = self.global_disc(global_feat)
+            
+            return (spatial_score + global_score) / 2
+        else:
+            return self.global_disc(features)
 
 
-class HardSampleMiner:
-    """Mine hard samples for focused training"""
-    def __init__(self, percentile=0.7):
-        self.percentile = percentile
+class AdaptiveHardSampleMiner:
+    """Dynamic hard sample mining with multiple criteria"""
+    def __init__(self, initial_percentile=0.7):
+        self.percentile = initial_percentile
+        self.difficulty_history = []
+        self.max_history = 100
     
-    def get_hard_samples(self, student_logits, teacher_logits, labels):
-        """Identify hard samples based on prediction disagreement"""
+    def update_percentile(self, epoch_progress):
+        """Increase focus on hard samples as training progresses"""
+        self.percentile = 0.7 + 0.2 * epoch_progress  # 0.7 -> 0.9
+    
+    def get_hard_samples(self, student_logits, teacher_logits, labels, student_feat, teacher_feat):
+        """Multi-criteria hard sample identification"""
         with torch.no_grad():
-            # KL divergence between student and teacher
+            # 1. Prediction disagreement (KL divergence)
             s_probs = F.softmax(student_logits, dim=1)
             t_probs = F.softmax(teacher_logits, dim=1)
             kl_div = torch.sum(t_probs * torch.log(t_probs / (s_probs + 1e-10) + 1e-10), dim=1)
             
-            # Get threshold for hard samples
-            threshold = torch.quantile(kl_div, self.percentile)
-            hard_mask = kl_div > threshold
+            # 2. Prediction confidence
+            s_conf = torch.max(s_probs, dim=1)[0]
+            confidence_penalty = 1.0 - s_conf
             
-        return hard_mask, kl_div
+            # 3. Feature distance
+            s_feat_flat = student_feat.view(student_feat.size(0), -1)
+            t_feat_flat = teacher_feat.view(teacher_feat.size(0), -1)
+            feat_dist = F.pairwise_distance(
+                F.normalize(s_feat_flat, dim=1),
+                F.normalize(t_feat_flat, dim=1)
+            )
+            
+            # Combined difficulty score
+            difficulty = kl_div + 0.5 * confidence_penalty + 0.3 * feat_dist
+            
+            # Track difficulty distribution
+            self.difficulty_history.append(difficulty.mean().item())
+            if len(self.difficulty_history) > self.max_history:
+                self.difficulty_history.pop(0)
+            
+            # Adaptive threshold
+            threshold = torch.quantile(difficulty, self.percentile)
+            hard_mask = difficulty > threshold
+            
+        return hard_mask, difficulty
 
 
 class MSFAMTrainer:
@@ -185,80 +325,39 @@ class MSFAMTrainer:
         )
         
         # Loss functions
-        self.wasserstein_loss = WassersteinFeatureLoss()
+        self.sliced_wasserstein_loss = SlicedWassersteinLoss(num_projections=50)
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')
         self.ce_loss = nn.CrossEntropyLoss()
         
         # Adaptive mixup
         self.mixup = AdaptiveUncertaintyMixup(self.teacher)
         
-        # Contrastive learning head
-        self.contrastive_head = ContrastiveLearningHead(feature_dim=512, projection_dim=128).to(device)
+        # Momentum contrastive head
+        self.contrastive_head = MomentumContrastiveHead(
+            feature_dim=512, projection_dim=128, queue_size=4096
+        ).to(device)
         
-        # Feature discriminator for adversarial alignment
-        self.discriminator = FeatureDiscriminator(feature_dim=512).to(device)
+        # Spectral-normalized discriminator
+        self.discriminator = SpectralNormDiscriminator(feature_dim=512).to(device)
         
-        # Hard sample miner
-        self.hard_miner = HardSampleMiner(percentile=0.7)
+        # Adaptive hard sample miner
+        self.hard_miner = AdaptiveHardSampleMiner(initial_percentile=0.7)
         
         self.teacher.eval()
     
     def _get_layer_names(self):
-        """Get names of key layers for feature extraction"""
+        """Get names of key layers including residuals"""
         layer_names = []
         for name, module in self.student.named_modules():
-            if isinstance(module, nn.Conv2d) and 'downsample' not in name:
+            # Capture both conv layers and residual connections
+            if isinstance(module, nn.Conv2d):
                 if any(f'layer{i}' in name for i in range(1, 5)):
-                    # Extract one layer per block
-                    if name.endswith('.conv2'):
+                    if name.endswith('.conv2') or 'downsample' in name:
                         layer_names.append(name)
-        return layer_names[:8]  # Limit to 8 layers for efficiency
-    
-    def compute_contrastive_loss(self, features1, features2, temperature=0.5):
-        """Compute contrastive loss between two feature sets"""
-        # Project features
-        z1 = self.contrastive_head(features1)
-        z2 = self.contrastive_head(features2)
-        
-        batch_size = z1.size(0)
-        
-        # Compute similarity matrix
-        z = torch.cat([z1, z2], dim=0)
-        sim_matrix = torch.mm(z, z.t()) / temperature
-        
-        # Create labels for positive pairs
-        labels = torch.arange(batch_size).to(self.device)
-        labels = torch.cat([labels + batch_size, labels])
-        
-        # Mask out self-similarity
-        mask = torch.eye(2 * batch_size, dtype=torch.bool).to(self.device)
-        sim_matrix.masked_fill_(mask, -9e15)
-        
-        # Compute loss
-        loss = F.cross_entropy(sim_matrix, labels)
-        return loss
-    
-    def compute_adversarial_loss(self, student_features, teacher_features):
-        """Compute adversarial loss for feature alignment"""
-        # Discriminator tries to distinguish student from teacher
-        student_pred = self.discriminator(student_features)
-        teacher_pred = self.discriminator(teacher_features.detach())
-        
-        # Student tries to fool discriminator (make features indistinguishable)
-        real_labels = torch.ones_like(student_pred)
-        fake_labels = torch.zeros_like(teacher_pred)
-        
-        # Adversarial loss for student (wants to be classified as "real"/teacher-like)
-        student_loss = F.binary_cross_entropy_with_logits(student_pred, real_labels)
-        
-        # Discriminator loss (distinguish student from teacher)
-        disc_loss = (F.binary_cross_entropy_with_logits(student_pred.detach(), fake_labels) +
-                     F.binary_cross_entropy_with_logits(teacher_pred, real_labels)) * 0.5
-        
-        return student_loss, disc_loss
+        return layer_names[:10]  # Capture more layers
     
     def compute_feature_alignment_loss(self, images):
-        """Compute multi-scale feature alignment loss"""
+        """Compute multi-scale feature alignment with efficient Wasserstein"""
         student_features = self.student_extractor(images)
         
         with torch.no_grad():
@@ -270,21 +369,50 @@ class MSFAMTrainer:
                 s_feat = student_features[layer_name]
                 t_feat = teacher_features[layer_name]
                 
-                # L2 loss
+                # L2 loss (always computed)
                 l2_loss = F.mse_loss(s_feat, t_feat)
                 
-                # Wasserstein loss (computed periodically for efficiency)
-                if np.random.random() < 0.1:  # 10% of the time
-                    w_loss = self.wasserstein_loss(s_feat, t_feat)
-                else:
-                    w_loss = torch.tensor(0.0, device=self.device)
+                # Sliced Wasserstein (differentiable, computed every iteration)
+                sw_loss = self.sliced_wasserstein_loss(s_feat, t_feat)
                 
-                feature_loss += l2_loss + 0.01 * w_loss
+                feature_loss += l2_loss + 0.1 * sw_loss
         
         return feature_loss / len(self.layer_names)
     
+    def compute_adversarial_loss(self, student_features, teacher_features):
+        """Compute stable adversarial loss with gradient penalty"""
+        # Discriminator predictions
+        student_pred = self.discriminator(student_features)
+        teacher_pred = self.discriminator(teacher_features.detach())
+        
+        # Wasserstein GAN loss (more stable)
+        student_loss = -student_pred.mean()
+        disc_loss = student_pred.detach().mean() - teacher_pred.mean()
+        
+        # Gradient penalty for Lipschitz constraint
+        alpha = torch.rand(student_features.size(0), 1, 1, 1, device=self.device)
+        if len(student_features.shape) == 2:
+            alpha = alpha.squeeze()
+        
+        interpolated = (alpha * teacher_features + (1 - alpha) * student_features.detach()).requires_grad_(True)
+        d_interpolated = self.discriminator(interpolated)
+        
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated,
+            inputs=interpolated,
+            grad_outputs=torch.ones_like(d_interpolated),
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        
+        gradients = gradients.view(gradients.size(0), -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        disc_loss += 10.0 * gradient_penalty
+        
+        return student_loss, disc_loss
+    
     def train_step(self, images, labels, optimizer, disc_optimizer, epoch, total_epochs, use_mixup=True):
-        """Enhanced training step with new components"""
+        """Enhanced training step with fixed conceptual issues"""
         self.student.train()
         self.contrastive_head.train()
         self.discriminator.train()
@@ -292,48 +420,49 @@ class MSFAMTrainer:
         images = images.to(self.device)
         labels = labels.to(self.device)
         
-        # Apply adaptive mixup
+        # Epoch progress for curriculum
+        epoch_progress = epoch / total_epochs
+        
+        # Update hard sample miner
+        self.hard_miner.update_percentile(epoch_progress)
+        
+        # Apply curriculum-aware adaptive mixup
         if use_mixup:
-            mixed_images, mixed_labels = self.mixup(images, labels)
+            mixed_images, mixed_labels = self.mixup(images, labels, epoch_progress)
         else:
             mixed_images, mixed_labels = images, labels
         
         optimizer.zero_grad()
         disc_optimizer.zero_grad()
         
-        # Student predictions
-        student_logits = self.student(mixed_images)
-        
-        # Teacher predictions
-        with torch.no_grad():
-            teacher_logits = self.teacher(mixed_images)
-        
-        # Get features for additional losses
+        # Get features
         self.student.get_feat = 'pre_GAP'
         self.teacher.get_feat = 'pre_GAP'
         
-        _, student_feat = self.student(mixed_images)
-        with torch.no_grad():
-            _, teacher_feat = self.teacher(mixed_images)
+        student_logits, student_feat = self.student(mixed_images)
         
-        # Hard sample mining
-        hard_mask, difficulty = self.hard_miner.get_hard_samples(student_logits, teacher_logits, labels)
+        with torch.no_grad():
+            teacher_logits, teacher_feat = self.teacher(mixed_images)
+        
+        # Multi-criteria hard sample mining
+        hard_mask, difficulty = self.hard_miner.get_hard_samples(
+            student_logits, teacher_logits, labels, student_feat, teacher_feat
+        )
         hard_weight = torch.ones_like(difficulty)
-        hard_weight[hard_mask] = 2.0  # Double weight for hard samples
+        hard_weight[hard_mask] = 2.0
         hard_weight = hard_weight / hard_weight.sum() * len(difficulty)
         
-        # Dynamic temperature based on training progress
-        progress = epoch / total_epochs
-        temperature = 3.0 + 2.0 * (1 - progress)  # Start at 5, end at 3
+        # Adaptive temperature scheduling
+        temperature = 4.0 - 1.0 * epoch_progress  # 4.0 -> 3.0
         
-        # Knowledge distillation loss with dynamic temperature
+        # Knowledge distillation loss
         kd_loss = self.kl_loss(
             F.log_softmax(student_logits / temperature, dim=1),
             F.softmax(teacher_logits / temperature, dim=1)
         ) * (temperature ** 2)
         
         # Classification loss with hard sample weighting
-        if len(mixed_labels.shape) == 2:  # Soft labels from mixup
+        if len(mixed_labels.shape) == 2:
             ce_loss = -torch.mean(
                 hard_weight * torch.sum(mixed_labels * F.log_softmax(student_logits, dim=1), dim=1)
             )
@@ -344,42 +473,21 @@ class MSFAMTrainer:
         # Feature alignment loss
         feat_loss = self.compute_feature_alignment_loss(mixed_images)
         
-        # Contrastive loss (self-supervised)
-        contrastive_loss = self.compute_contrastive_loss(student_feat, teacher_feat)
+        # Momentum contrastive loss with hard negatives
+        contrastive_temp = 0.07 + 0.03 * (1 - epoch_progress)  # Adaptive temperature
+        contrastive_loss = self.contrastive_head(
+            student_feat, teacher_feat, temperature=contrastive_temp, use_hard_negatives=True
+        )
         
-        # Adversarial feature alignment
+        # Adversarial feature alignment with gradient penalty
         adv_student_loss, adv_disc_loss = self.compute_adversarial_loss(student_feat, teacher_feat)
         
-        # Feature consistency regularization
-        with torch.no_grad():
-            _, student_feat2 = self.student(mixed_images)
-        consistency_loss = F.mse_loss(student_feat, student_feat2)
-        
-        # Adaptive loss composition based on training progress
-        if progress < 0.3:
-            # Early phase: focus on basic learning
-            lambda_ce = 0.4
-            lambda_kd = 0.3
-            lambda_feat = 0.2
-            lambda_contrast = 0.05
-            lambda_adv = 0.05
-            lambda_consist = 0.0
-        elif progress < 0.7:
-            # Middle phase: balanced learning
-            lambda_ce = 0.25
-            lambda_kd = 0.35
-            lambda_feat = 0.2
-            lambda_contrast = 0.1
-            lambda_adv = 0.05
-            lambda_consist = 0.05
-        else:
-            # Late phase: fine-tuning with all components
-            lambda_ce = 0.2
-            lambda_kd = 0.3
-            lambda_feat = 0.2
-            lambda_contrast = 0.15
-            lambda_adv = 0.1
-            lambda_consist = 0.05
+        # Smooth loss weight transition
+        lambda_ce = 0.4 - 0.2 * epoch_progress
+        lambda_kd = 0.3 + 0.1 * epoch_progress
+        lambda_feat = 0.2
+        lambda_contrast = 0.05 + 0.1 * epoch_progress
+        lambda_adv = 0.05
         
         # Combined loss
         total_loss = (
@@ -387,15 +495,20 @@ class MSFAMTrainer:
             lambda_kd * kd_loss +
             lambda_feat * feat_loss +
             lambda_contrast * contrastive_loss +
-            lambda_adv * adv_student_loss +
-            lambda_consist * consistency_loss
+            lambda_adv * adv_student_loss
         )
         
         total_loss.backward()
+        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.contrastive_head.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
-        # Update discriminator
+        # Update discriminator (every iteration for WGAN)
         adv_disc_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         disc_optimizer.step()
         
         return {
@@ -405,7 +518,6 @@ class MSFAMTrainer:
             'feat_loss': feat_loss.item(),
             'contrastive_loss': contrastive_loss.item(),
             'adv_loss': adv_student_loss.item(),
-            'consistency_loss': consistency_loss.item(),
             'hard_samples_pct': hard_mask.float().mean().item()
         }
     
@@ -421,22 +533,23 @@ def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr
     
     trainer = MSFAMTrainer(student_model, teacher_model, device)
     
-    # Optimizer for student, contrastive head
+    # Optimizer for student and contrastive head
     optimizer = torch.optim.SGD(
         list(student_model.parameters()) + list(trainer.contrastive_head.parameters()),
         lr=lr,
         momentum=0.9,
-        weight_decay=1e-4
+        weight_decay=1e-4,
+        nesterov=True
     )
     
-    # Separate optimizer for discriminator
+    # Separate optimizer for discriminator (Adam for stability)
     disc_optimizer = torch.optim.Adam(
         trainer.discriminator.parameters(),
         lr=0.0001,
         betas=(0.5, 0.999)
     )
     
-    # Cosine annealing scheduler with warmup
+    # Cosine annealing with warmup
     warmup_epochs = int(0.1 * epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
@@ -450,7 +563,6 @@ def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr
             'feat_loss': 0,
             'contrastive_loss': 0,
             'adv_loss': 0,
-            'consistency_loss': 0,
             'hard_samples_pct': 0
         }
         
@@ -480,6 +592,7 @@ def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr
             print(f"Epoch {epoch+1}/{epochs}")
             print(" - ".join([f"{k}: {v:.4f}" for k, v in epoch_losses.items()]))
             print(f"Current LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"Hard sample percentile: {trainer.hard_miner.percentile:.2f}")
     
     trainer.cleanup()
     return student_model

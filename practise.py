@@ -518,6 +518,7 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     
                     losses = trainer.train_step(data, target, optimizer)
                     
+                    # Clear cache to reduce memory usage
                     if iter_nums % 10 == 0:
                         torch.cuda.empty_cache()
                     
@@ -594,6 +595,8 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     else:
         # Default to CLKD
         train_clkd(train_loader, metric_loader, optimizer, prune_model, origin_model, args)
+
+
 
 
 def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
@@ -700,6 +703,77 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
                     )
                 )
 
+# do not modify below "metric" function
+def metric(metric_loader, model, origin_model, trained=False):
+    criterion = torch.nn.MSELoss(reduction="mean")
+
+    # switch to train mode
+    origin_model.cuda()
+    origin_model.eval()
+    origin_model.get_feat = "pre_GAP"
+    model.cuda()
+    model.eval()
+    model.get_feat = "pre_GAP"
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    accuracies = AverageMeter()
+    origin_accuracies = AverageMeter()
+
+    # Initialize per-category accuracy tracking
+    num_classes = 1000  # Assuming ImageNet classes
+    correct_per_class = torch.zeros(num_classes).cuda()
+    total_per_class = torch.zeros(num_classes).cuda()
+    origin_correct_per_class = torch.zeros(num_classes).cuda()
+    # Initialize per-class MSE loss tracking
+    mse_loss_per_class = torch.zeros(num_classes).cuda()
+
+    end = time.time()
+    for i, (data, target) in enumerate(metric_loader):
+        with torch.no_grad():
+            data = data.cuda()
+            target = target.cuda()
+            data_time.update(time.time() - end)
+            t_output, t_features = origin_model(data)
+            s_output, s_features = model(data)
+            loss = criterion(s_features, t_features)
+
+            # Calculate overall accuracy
+            acc = accuracy(s_output, target, topk=(1,))[0]
+            origin_acc = accuracy(t_output, target, topk=(1,))[0]
+
+        losses.update(loss.data.item(), data.size(0))
+        accuracies.update(acc.item(), data.size(0))
+        origin_accuracies.update(origin_acc.item(), data.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+        if i % 10 == 0:
+            print(
+                "Metric: [{0}/{1}]\t"
+                "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                "Loss {losses.val:.4f} ({losses.avg:.4f})\t"
+                "Accuracy {accuracies.val:.2f} ({accuracies.avg:.2f})".format(
+                    i,
+                    len(metric_loader),
+                    batch_time=batch_time,
+                    data_time=data_time,
+                    losses=losses,
+                    accuracies=accuracies,
+                )
+            )
+
+    print(" * Metric Loss {loss.avg:.4f}".format(loss=losses))
+
+    problematic_classes = []
+    print(
+        f"Overall Accuracy - Pruned: {accuracies.avg:.2f}%, Original: {origin_accuracies.avg:.2f}%"
+    )
+
+    return losses.avg, accuracies.avg, origin_accuracies.avg, problematic_classes
 
 def nmse_loss(p, z):
     p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)

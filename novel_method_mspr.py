@@ -89,7 +89,14 @@ class MSPRTrainer:
     def _create_ema_model(self):
         """Create EMA model for self-distillation"""
         import copy
-        ema_model = copy.deepcopy(self.student)
+        # Get the underlying model without AdaptorWarp
+        if hasattr(self.student, 'model'):
+            # Student is wrapped in AdaptorWarp, get the base model
+            base_model = self.student.model
+            ema_model = copy.deepcopy(base_model)
+        else:
+            ema_model = copy.deepcopy(self.student)
+        
         for param in ema_model.parameters():
             param.requires_grad = False
         ema_model.eval()
@@ -97,8 +104,14 @@ class MSPRTrainer:
     
     def _update_ema(self):
         """Update EMA model with current student weights"""
+        # Get the base model parameters (unwrapped)
+        if hasattr(self.student, 'model'):
+            student_params = self.student.model.parameters()
+        else:
+            student_params = self.student.parameters()
+            
         with torch.no_grad():
-            for ema_param, student_param in zip(self.ema_model.parameters(), self.student.parameters()):
+            for ema_param, student_param in zip(self.ema_model.parameters(), student_params):
                 ema_param.data.mul_(self.ema_decay).add_(student_param.data, alpha=1 - self.ema_decay)
     
     def _progressive_unfreeze(self, epoch, total_epochs):

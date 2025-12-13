@@ -288,11 +288,42 @@ class EnhancedMSFAMTrainer:
         self.student.get_feat = 'pre_GAP'
         self.teacher.get_feat = 'pre_GAP'
         
-        # Forward pass
-        student_logits, student_feat = self.student(images)
-        
+        # === STEP 1: Update Discriminator (completely separate) ===
         with torch.no_grad():
+            _, student_feat_for_disc = self.student(images)
             teacher_logits, teacher_feat = self.teacher(images)
+        
+        # Discriminator forward and backward
+        real_score = self.discriminator(teacher_feat.detach())
+        fake_score = self.discriminator(student_feat_for_disc.detach())
+        
+        disc_loss = torch.mean(fake_score) - torch.mean(real_score)
+        
+        # Gradient penalty
+        alpha = torch.rand(student_feat_for_disc.size(0), 1, 1, 1, device=self.device)
+        interpolated = (alpha * teacher_feat.detach() + (1 - alpha) * student_feat_for_disc.detach()).requires_grad_(True)
+        d_interpolated = self.discriminator(interpolated)
+        
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated,
+            inputs=interpolated,
+            grad_outputs=torch.ones_like(d_interpolated),
+            create_graph=True,
+            retain_graph=False,
+            only_inputs=True
+        )[0]
+        
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        disc_total_loss = disc_loss + 10 * gradient_penalty
+        
+        self.disc_optimizer.zero_grad()
+        disc_total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
+        self.disc_optimizer.step()
+        
+        # === STEP 2: Update Student (main optimization) ===
+        # Fresh forward pass for student
+        student_logits, student_feat = self.student(images)
         
         # 1. Classification loss
         if len(labels.shape) == 1:
@@ -303,7 +334,7 @@ class EnhancedMSFAMTrainer:
         # 2. KD loss with adaptive temperature
         base_temp = 4.0
         progress = epoch / total_epochs
-        temperature = base_temp * (1.0 - 0.5 * progress)  # Decrease temperature over time
+        temperature = base_temp * (1.0 - 0.5 * progress)
         
         kd_loss = self.kl_loss(
             F.log_softmax(student_logits / temperature, dim=1),
@@ -322,14 +353,9 @@ class EnhancedMSFAMTrainer:
         else:
             multi_scale_loss = torch.tensor(0.0).to(self.device)
         
-        # 6. Adversarial feature matching
-        gen_loss, disc_loss = self.compute_adversarial_loss(student_feat, teacher_feat)
-        
-        # Update discriminator (separate from main optimization)
-        self.disc_optimizer.zero_grad()
-        disc_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
-        self.disc_optimizer.step()
+        # 6. Generator loss (fool discriminator)
+        fake_score_gen = self.discriminator(student_feat)
+        gen_loss = -torch.mean(fake_score_gen)
         
         # 7. Feature magnitude matching
         s_feat_norm = torch.norm(student_feat.view(student_feat.size(0), -1), dim=1)
@@ -338,7 +364,6 @@ class EnhancedMSFAMTrainer:
         
         # Progressive loss weights
         if epoch < 200:
-            # Early phase: focus on basic alignment
             lambda_ce = 0.2
             lambda_kd = 0.6
             lambda_attn = 0.1
@@ -347,7 +372,6 @@ class EnhancedMSFAMTrainer:
             lambda_adv = 0.0
             lambda_norm = 0.0
         elif epoch < 1000:
-            # Middle phase: introduce advanced losses
             alpha = (epoch - 200) / 800
             lambda_ce = 0.15
             lambda_kd = 0.5
@@ -357,7 +381,6 @@ class EnhancedMSFAMTrainer:
             lambda_adv = 0.05 * alpha
             lambda_norm = 0.05 * alpha
         else:
-            # Late phase: balanced training
             lambda_ce = 0.1
             lambda_kd = 0.4
             lambda_attn = 0.2
@@ -366,7 +389,7 @@ class EnhancedMSFAMTrainer:
             lambda_adv = 0.05
             lambda_norm = 0.05
         
-        # Combined loss
+        # Combined loss for student
         total_loss = (
             lambda_ce * ce_loss +
             lambda_kd * kd_loss +
@@ -377,13 +400,10 @@ class EnhancedMSFAMTrainer:
             lambda_norm * norm_loss
         )
         
-        # Backward and optimize
+        # Backward and optimize student
         optimizer.zero_grad()
         total_loss.backward()
-        
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=5.0)
-        
         optimizer.step()
         
         return {
@@ -395,7 +415,7 @@ class EnhancedMSFAMTrainer:
             'multi_scale_loss': multi_scale_loss.item(),
             'adv_loss': gen_loss.item(),
             'norm_loss': norm_loss.item(),
-            'disc_loss': disc_loss.item()
+            'disc_loss': disc_total_loss.item()
         }
     
     def cleanup(self):

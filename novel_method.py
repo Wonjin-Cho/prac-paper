@@ -66,10 +66,11 @@ class SlicedWassersteinLoss(nn.Module):
 
 class AdaptiveUncertaintyMixup:
     """Mixup with curriculum-based uncertainty weighting"""
-    def __init__(self, teacher_model, alpha=1.0):
+     def __init__(self, teacher_model, alpha=1.0, num_classes=1000):
         self.teacher_model = teacher_model
         self.alpha = alpha
         self.uncertainty_ema = None
+        self.num_classes = num_classes
         self.ema_decay = 0.9
     
     def compute_uncertainty(self, images):
@@ -110,7 +111,7 @@ class AdaptiveUncertaintyMixup:
         
         # Convert hard labels to soft labels if needed
         if len(labels.shape) == 1:
-            num_classes = labels.max().item() + 1
+            
             mixed_labels = torch.zeros(batch_size, num_classes, device=labels.device)
             
             for i in range(batch_size):
@@ -319,10 +320,11 @@ class AdaptiveHardSampleMiner:
 
 class MSFAMTrainer:
     """Enhanced Multi-Scale Feature Alignment with Adaptive Mixup Trainer"""
-    def __init__(self, student_model, teacher_model, device='cuda'):
+    def __init__(self, student_model, teacher_model, num_classes=1000, device='cuda'):
         self.student = student_model.to(device)
         self.teacher = teacher_model.to(device)
         self.device = device
+        self.num_classes = num_classes
         
         # Extract layer names for multi-scale features
         self.layer_names = self._get_layer_names()
@@ -341,7 +343,7 @@ class MSFAMTrainer:
         self.ce_loss = nn.CrossEntropyLoss()
         
         # Adaptive mixup
-        self.mixup = AdaptiveUncertaintyMixup(self.teacher)
+        self.mixup = AdaptiveUncertaintyMixup(self.teacher, num_classes=num_classes)
         
         # Momentum contrastive head
         self.contrastive_head = MomentumContrastiveHead(

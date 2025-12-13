@@ -189,7 +189,7 @@ def main():
     args.dataset = "fakenet"
     args.batch_size = 64  # Ensure consistent batch size
     args.use_msfam = False  # Set to True to use MSFAM novel training method
-    args.training_method = 'combined'  # Options: 'clkd', 'mmd', 'attention', 'contrastive', 'combined'
+    args.training_method = 'mspr'  # Options: 'clkd', 'mmd', 'attention', 'contrastive', 'combined', 'mspr'
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -360,15 +360,15 @@ def main():
         )
         # rm_blocks = ["layer3.3"]  # , 'layer2.1']
         # rm_blocks = ['layer2.1']#, 'layer2.2', 'layer3.2', 'layer3.3'] # 'layer1.2', 'layer2.2',
-        pruned_model1, _ = Practise_one_block(
-            rm_blocks,
-            pruned_model,
-            origin_lat,
-            train_loader,
-            metric_loader,
-            args,
-            len(rm_blocks),
-        )
+        # pruned_model1, _ = Practise_one_block(
+        #     rm_blocks,
+        #     pruned_model,
+        #     origin_lat,
+        #     train_loader,
+        #     metric_loader,
+        #     args,
+        #     len(rm_blocks),
+        # )
 
     else:
         pruned_model, _, pruned_lat = build_student(

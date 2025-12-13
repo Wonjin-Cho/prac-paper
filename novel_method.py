@@ -308,15 +308,16 @@ class EnhancedMSFAMTrainer:
             outputs=d_interpolated,
             inputs=interpolated,
             grad_outputs=torch.ones_like(d_interpolated),
-            create_graph=True,
+            create_graph=False,  # Changed to False - we don't need to backprop through this again
             retain_graph=False,
             only_inputs=True
         )[0]
         
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
-        disc_total_loss = disc_loss + 10 * gradient_penalty
         
+        # Compute discriminator loss without gradient penalty in the graph
         self.disc_optimizer.zero_grad()
+        disc_total_loss = disc_loss + 10 * gradient_penalty
         disc_total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
         self.disc_optimizer.step()

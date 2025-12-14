@@ -6,6 +6,7 @@ import collections
 from datetime import datetime
 import time
 
+# from xml.parsers.expat import model
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ import pickle
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
+# torch.manual_seed(487)
 
 from models import *
 import dataset
@@ -29,10 +31,37 @@ from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
 from novel_method import MSFAMTrainer, train_with_msfam
-from novel_method_mmd import MMDKDTrainer
-from novel_method_attention import AttentionKDTrainer
-from novel_method_contrastive import ContrastiveKDTrainer
-from novel_method_mspr import MSPRTrainer, train_with_mspr
+
+
+class ModelEMA:
+    """Exponential Moving Average for model parameters"""
+    def __init__(self, model, decay=0.9999):
+        self.module = copy.deepcopy(model)
+        self.module.eval()
+        self.decay = decay
+
+    def update(self, model):
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.module.parameters(), model.parameters()):
+                ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1 - self.decay)
+
+    def state_dict(self):
+        return self.module.state_dict()
+
+from models import *
+import dataset
+from models.resnet import BasicBlock, Bottleneck
+from loops_mixstd import train_distill
+
+from finetune import AverageMeter, validate, accuracy
+from compute_flops import compute_MACs_params
+from models.AdaptorWarp import AdaptorWarp
+from models.BlockReinitWarp import BlockReinitWarp
+from past_src.Grasp import GraSP, compute_importance_resnet
+from models.resnet import load_rm_block_state_dict
+from past_src.distill_data import DistillData
+from past_src.generate_data import arg_parse
+from novel_method import MSFAMTrainer, train_with_msfam
 
 
 def assert_finite(name, tensor):
@@ -95,36 +124,6 @@ class OutputHook:
         """
         self.outputs = None
 
-
-def compute_variance_loss(model, rm_blocks):
-    variance_loss = 0.0
-    for name, param in model.named_parameters():
-        # Match block names (e.g., 'layer3.1.conv1.weight')
-        for block in rm_blocks:
-            if block in name and "conv" in name:
-                var = torch.sum(param)
-                variance_loss += abs(var)
-                # param.grad *= 2
-            # print(f"block and name {block}: {name}")
-    return variance_loss
-
-
-def print_block_BN_statistics(model):
-    # Iterate over all modules and look for blocks (e.g., BasicBlock or Bottleneck)
-    for name, module in model.named_modules():
-        print(f"Block: {name}")
-        # Now iterate over submodules in the block and find BN layers
-        for subname, submodule in module.named_modules():
-            if isinstance(submodule, nn.BatchNorm2d):
-                aggregated_mean = submodule.weight.data.mean().item()
-                aggregated_var = submodule.weight.data.var().item()
-                print(f"  BN layer {subname}:")
-                print(f"    Running Mean: {aggregated_mean}")
-                print(f"    Running Var : {aggregated_var}")
-        print("-" * 50)
-        break
-
-
 def Practise_one_block(
     rm_block, origin_model, origin_lat, train_loader, metric_loader, args, drop_blocks=0
 ):
@@ -160,7 +159,7 @@ def Practise_one_block(
     score = 0
     # print(f"{rm_block} -> {recoverability:.4f}/{lat_reduction:.2f}={score:.5f}")
     device = "cuda"
-
+    
     return pruned_model, (recoverability, lat_reduction, score)
 
 
@@ -212,7 +211,6 @@ def Practise_all_blocks(
     print(f"=> latency reduction: {lat_reduction:.2f}%")
 
     return pruned_model, drop_blocks
-
 
 def insert_one_block_adaptors_for_mobilenet(
     origin_model, prune_model, rm_block, params, args
@@ -420,179 +418,12 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     )
 
     recover_time = time.time()
-
-    # Select training method based on args
-    if hasattr(args, 'use_msfam') and args.use_msfam:
-        print("Using Progressive Block Recovery (Hybrid: Contrastive + Attention + Adaptive KD)")
-        from novel_method import ProgressiveBlockRecoveryTrainer
-
-        # Create trainer with rm_blocks info
-        trainer = ProgressiveBlockRecoveryTrainer(prune_model, origin_model, rm_blocks=rm_blocks, num_classes=args.num_classes)
-
-        # Training loop
-        iter_nums = 0
-        finish = False
-        while not finish:
-            for batch_idx, (data, target) in enumerate(train_loader):
-                iter_nums += 1
-                if iter_nums > args.epoch:
-                    finish = True
-                    break
-
-                losses = trainer.train_step(
-                    data, target, optimizer,
-                    iter_nums, args.epoch
-                )
-
-                # Clear cache to reduce memory usage
-                if iter_nums % 10 == 0:
-                    torch.cuda.empty_cache()
-
-                if iter_nums % 50 == 0:
-                    print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                          f"Total: {losses['total_loss']:.4f}\t"
-                          f"CE: {losses['ce_loss']:.4f}\t"
-                          f"KD: {losses['kd_loss']:.4f}\t"
-                          f"Contrast: {losses['contrast_loss']:.4f}\t"
-                          f"Attention: {losses['attention_loss']:.4f}")
-
-        trainer.cleanup()
-    elif hasattr(args, 'training_method'):
-        if args.training_method == 'alkd':
-            print("Using ALKD-CR method (Adaptive Layer-wise KD with Channel Recalibration)")
-            from novel_method_alkd import ALKDCRTrainer
-            trainer = ALKDCRTrainer(prune_model, origin_model, rm_blocks)
-
-            # Add feature aligner parameters to optimizer
-            all_params = trainer.get_trainable_parameters()
-            if args.opt == "SGD":
-                optimizer = torch.optim.SGD(
-                    all_params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay
-                )
-            elif args.opt == "Adam":
-                optimizer = torch.optim.Adam(all_params, lr=args.lr, weight_decay=args.weight_decay)
-            elif args.opt == "AdamW":
-                optimizer = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
-
-            # Training loop
-            iter_nums = 0
-            finish = False
-            while not finish:
-                for batch_idx, (data, target) in enumerate(train_loader):
-                    iter_nums += 1
-                    if iter_nums > args.epoch:
-                        finish = True
-                        break
-
-                    losses = trainer.train_step(data, target, optimizer, iter_nums, args.epoch)
-
-                    # Clear cache to reduce memory usage
-                    if iter_nums % 10 == 0:
-                        torch.cuda.empty_cache()
-
-                    if iter_nums % 50 == 0:
-                        print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                              f"Total Loss {losses['total_loss']:.4f}\t"
-                              f"KD Loss {losses['kd_loss']:.4f}\t"
-                              f"CE Loss {losses['ce_loss']:.4f}\t"
-                              f"Feature Loss {losses['feature_loss']:.4f}\t"
-                              f"Avg Difficulty {losses['avg_difficulty']:.4f}")
-        elif args.training_method == 'combined':
-            print("Using Combined KD method (MMD + Relation + Attention + Contrastive)")
-            from novel_method_combined import CombinedKDTrainer
-            trainer = CombinedKDTrainer(prune_model, origin_model)
-
-            # Training loop - similar format to other methods
-            iter_nums = 0
-            finish = False
-            while not finish:
-                for batch_idx, (data, target) in enumerate(train_loader):
-                    iter_nums += 1
-                    if iter_nums > args.epoch:
-                        finish = True
-                        break
-
-                    losses = trainer.train_step(data, target, optimizer)
-
-                    # Clear cache to reduce memory usage
-                    if iter_nums % 10 == 0:
-                        torch.cuda.empty_cache()
-
-                    if iter_nums % 50 == 0:
-                        print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                              f"Total Loss {losses['total_loss']:.4f}\t"
-                              f"KD Loss {losses['kd_loss']:.4f}\t"
-                              f"CE Loss {losses['ce_loss']:.4f}\t"
-                              f"MMD Loss {losses['mmd_loss']:.4f}\t"
-                              f"Relation Loss {losses['relation_loss']:.4f}\t"
-                              f"Attention Loss {losses['attention_loss']:.4f}\t"
-                              f"Contrastive Loss {losses['contrastive_loss']:.4f}")
-        elif args.training_method == 'mmd':
-            print("Using MMD KD method")
-            from novel_method_mmd import MMDKDTrainer
-            trainer = MMDKDTrainer(prune_model, origin_model)
-            for batch_idx, (data, target) in enumerate(train_loader):
-                if batch_idx >= args.epoch: # Assuming args.epoch refers to number of training iterations/epochs
-                    break
-                trainer.train_step(data, target, optimizer)
-        elif args.training_method == 'attention':
-            print("Using Attention KD method")
-            from novel_method_attention import AttentionKDTrainer
-            trainer = AttentionKDTrainer(prune_model, origin_model)
-            for batch_idx, (data, target) in enumerate(train_loader):
-                if batch_idx >= args.epoch: # Assuming args.epoch refers to number of training iterations/epochs
-                    break
-                trainer.train_step(data, target, optimizer)
-        elif args.training_method == 'contrastive':
-            print("Using Contrastive KD method")
-            from novel_method_contrastive import ContrastiveKDTrainer
-            trainer = ContrastiveKDTrainer(prune_model, origin_model)
-            for batch_idx, (data, target) in enumerate(train_loader):
-                if batch_idx >= args.epoch: # Assuming args.epoch refers to number of training iterations/epochs
-                    break
-                trainer.train_step(data, target, optimizer)
-        elif args.training_method == 'mspr':
-            print("Using MSPR KD method")
-            # Create discriminator optimizer
-            trainer = MSPRTrainer(prune_model, origin_model, rm_blocks)
-            disc_optimizer = torch.optim.Adam(
-                trainer.discriminator.parameters(),
-                lr=0.001,
-                betas=(0.5, 0.999)
-            )
-
-            # Training loop - similar format to train_clkd
-            iter_nums = 0
-            finish = False
-            while not finish:
-                for batch_idx, (data, target) in enumerate(train_loader):
-                    iter_nums += 1
-                    if iter_nums > args.epoch:
-                        finish = True
-                        break
-
-                    losses = trainer.train_step(
-                        data, target, optimizer, disc_optimizer,
-                        iter_nums, args.epoch, use_augmentation=True
-                    )
-
-                    # Clear cache to reduce memory usage
-                    if iter_nums % 10 == 0:
-                        torch.cuda.empty_cache()
-
-                    if iter_nums % 50 == 0:
-                        print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                              f"Total Loss {losses['total_loss']:.4f}\t"
-                              f"KD Loss {losses['kd_loss']:.4f}\t"
-                              f"CE Loss {losses['ce_loss']:.4f}")
-        else:
-            print("Using CLKD method")
-            train_clkd(train_loader, metric_loader, optimizer, prune_model, origin_model, args)
-    else:
-        # Default to CLKD
-        train_clkd(train_loader, metric_loader, optimizer, prune_model, origin_model, args)
-
-
+    train(train_loader, optimizer, prune_model, origin_model, args, scheduler, warmup_epochs)
+    print(
+        "compute recoverability {} takes {}s".format(
+            rm_blocks, time.time() - recover_time
+        )
+    )
 
 
 def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
@@ -699,7 +530,203 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
                     )
                 )
 
-# do not modify below "metric" function
+def nmse_loss(p, z):
+    p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)
+    z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+    return torch.mean((p_norm - z_norm) ** 2)
+
+
+def class_correlation_matrix(Z):
+    """
+    Z: [B, C] feature matrix (batch x channels)
+    returns: [C x C] class correlation matrix
+    """
+    Z = Z.view(Z.size(0), -1).contiguous()  # Flatten and ensure 2D [B, C]
+    Z_mean = Z.mean(dim=0, keepdim=True)  # [1, C]
+    Z_centered = Z - Z_mean  # [B, C]
+    return Z_centered.T @ Z_centered / (Z.size(0) - 1)
+
+
+def train_clkd(
+    train_loader,
+    metric_loader,
+    optimizer,
+    model,
+    origin_model,
+    args,
+    problematic_classes=None,
+):
+    end = time.time()
+    ce_criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # Adaptive loss weights with warmup
+    warmup_epochs = int(0.1 * args.epoch)
+
+    # Temperature for knowledge distillation
+    temperature = 4.0
+
+    def get_loss_weights(current_iter):
+        if current_iter < warmup_epochs:
+            alpha = current_iter / warmup_epochs
+            lambda_ce = 0.2 + 0.1 * alpha
+            lambda_kd = 0.3 + 0.2 * alpha
+            mu_nmse = 0.3 + 0.2 * alpha
+            nu_cc = 0.05 + 0.15 * alpha
+        else:
+            lambda_ce = 0.2
+            lambda_kd = 0.5
+            mu_nmse = 0.4
+            nu_cc = 0.2
+        return lambda_ce, lambda_kd, mu_nmse, nu_cc
+
+    # Extract features from pre-GAP layer
+    model.get_feat = "pre_GAP"
+    origin_model.get_feat = "pre_GAP"
+
+    model.cuda().train()
+    origin_model.cuda().eval()
+
+    iter_nums = 0
+    finish = False
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+
+    while not finish:
+        for batch_idx, (data, target) in enumerate(train_loader):
+            iter_nums += 1
+            if iter_nums > args.epoch:
+                finish = True
+                break
+
+            # sanitize inputs
+            if isinstance(data, torch.Tensor):
+                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
+            else:
+                data = safe_to_device(data)
+
+            target = target.cuda()
+            data_time.update(time.time() - end)
+
+            with torch.no_grad():
+                t_logits, t_features = origin_model(data)
+
+            # check teacher features
+            if not assert_finite("t_features", t_features):
+                print(f"[batch {iter_nums}] skipping: teacher features non-finite")
+                continue
+
+            s_logits, s_features = model(data)
+            # check student features
+            if not assert_finite("s_features", s_features):
+                print(f"[batch {iter_nums}] skipping: student features non-finite")
+                continue
+            if not assert_finite("s_logits", s_logits):
+                print(f"[batch {iter_nums}] skipping: student logits non-finite")
+                continue
+
+            ce_loss = ce_criterion(s_logits, target)
+            if not assert_finite("ce_loss", ce_loss):
+                print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
+                continue
+
+            # Soft target KD loss with temperature scaling
+            t_soft = F.softmax(t_logits / temperature, dim=1)
+            s_soft = F.log_softmax(s_logits / temperature, dim=1)
+            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
+
+            if not assert_finite("kd_soft_loss", kd_soft_loss):
+                print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
+                continue
+
+            l_ins = nmse_loss(s_features, t_features)
+            if problematic_classes is None:
+                l_cla = nmse_loss(s_features.T, t_features.T)
+                cc_s = class_correlation_matrix(s_features)
+                cc_t = class_correlation_matrix(t_features)
+                cc_loss = torch.mean((cc_s - cc_t) ** 2)
+            else:
+                l_cla, cc_loss = compute_focused_class_losses(
+                    s_features, t_features, target, problematic_classes
+                )
+
+            # Get adaptive loss weights
+            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
+
+            kd_feature_loss = l_ins + l_cla
+            total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
+
+            if not assert_finite("total_loss", total_loss):
+                print(f"[batch {iter_nums}] skipping: total_loss non-finite")
+                continue
+
+            optimizer.zero_grad()
+            try:
+                # enable anomaly detection around backward to get op stack if needed
+                with torch.autograd.set_detect_anomaly(True):
+                    total_loss.backward()
+                # gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
+                )
+                optimizer.step()
+            except RuntimeError as e:
+                print(f"[batch {iter_nums}] backward failed: {e}")
+                # optionally save offending batch for inspection
+                try:
+                    torch.save(
+                        {"data": data.detach().cpu(), "target": target.detach().cpu()},
+                        f"bad_batch_{iter_nums}.pt",
+                    )
+                    print(f"Saved bad batch bad_batch_{iter_nums}.pt")
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
+                continue
+
+            losses.update(total_loss.item(), data.size(0))
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if iter_nums % 50 == 0:
+                print(
+                    f"Train: [{iter_nums}/{args.epoch}]\t"
+                    f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    f"Loss {losses.val:.4f} ({losses.avg:.4f})"
+                )
+
+
+def compute_focused_class_losses(s_features, t_features, targets, focused_classes):
+    """
+    Compute class NMSE and correlation loss for selected classes only.
+    """
+    # Flatten features to [B, C]
+    s_feat = s_features.view(s_features.size(0), -1).contiguous()
+    t_feat = t_features.view(t_features.size(0), -1).contiguous()
+
+    # Mask for focused classes
+    mask = torch.tensor(
+        [c in focused_classes for c in targets.cpu().tolist()], device=targets.device
+    )
+    if mask.sum() < 2:
+        # Not enough samples in batch from focused classes, skip
+        return 0.0, 0.0
+
+    s_selected = s_feat[mask]
+    t_selected = t_feat[mask]
+
+    # Class-level NMSE (transpose)
+    class_nmse = nmse_loss(s_selected.T, t_selected.T)
+
+    # Class correlation loss
+    cc_s = class_correlation_matrix(s_selected)
+    cc_t = class_correlation_matrix(t_selected)
+    cc_loss = torch.mean((cc_s - cc_t) ** 2)
+
+    return class_nmse, cc_loss
+
+
 def metric(metric_loader, model, origin_model, trained=False):
     criterion = torch.nn.MSELoss(reduction="mean")
 
@@ -762,7 +789,7 @@ def metric(metric_loader, model, origin_model, trained=False):
                 )
             )
 
-    print(" * Metric Loss {loss.avg:.4f}".format(loss=losses))
+    print(" * Metric Loss {loss.avg:.4f}")
 
     problematic_classes = []
     print(
@@ -771,181 +798,245 @@ def metric(metric_loader, model, origin_model, trained=False):
 
     return losses.avg, accuracies.avg, origin_accuracies.avg, problematic_classes
 
-def nmse_loss(p, z):
-    p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)
-    z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-    return torch.mean((p_norm - z_norm) ** 2)
 
-
-def class_correlation_matrix(Z):
-    """
-    Z: [B, C] feature matrix (batch x channels)
-    returns: [C x C] class correlation matrix
-    """
-    Z = Z.view(Z.size(0), -1).contiguous()  # Flatten and ensure 2D [B, C]
-    Z_mean = Z.mean(dim=0, keepdim=True)  # [1, C]
-    Z_centered = Z - Z_mean  # [B, C]
-    return Z_centered.T @ Z_centered / (Z.size(0) - 1)
-
-
-def train_clkd(
-    train_loader,
-    metric_loader,
-    optimizer,
-    model,
-    origin_model,
-    args,
-    problematic_classes=None,
+def train_focused(
+    train_loader, metric_loader, optimizer, model, origin_model, args, target_classes
 ):
-    end = time.time()
-    ce_criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    """
+    Train the model focusing on specific classes with large accuracy differences
+    """
+    criterion = torch.nn.MSELoss(reduction="mean")
+    cls_criterion = torch.nn.CrossEntropyLoss()
 
-    # Adaptive loss weights with warmup
-    warmup_epochs = int(0.1 * args.epoch)
+    # switch to train mode
+    origin_model.cuda()
+    origin_model.eval()
+    model.cuda()
+    model.train()
 
-    # Gradient accumulation
-    accumulation_steps = 2
-
-    # Temperature for knowledge distillation
-    base_temperature = 4.0
-
-    def get_loss_weights(current_iter, total_iters):
-        progress = current_iter / total_iters
-        if current_iter < warmup_epochs:
-            alpha = current_iter / warmup_epochs
-            lambda_ce = 0.15 + 0.1 * alpha
-            lambda_kd = 0.35 + 0.15 * alpha
-            mu_nmse = 0.35 + 0.15 * alpha
-            nu_cc = 0.05 + 0.1 * alpha
-        else:
-            # Gradually shift weight to KD and CE
-            lambda_ce = 0.2 + 0.05 * progress
-            lambda_kd = 0.5
-            mu_nmse = 0.35 - 0.1 * progress
-            nu_cc = 0.15 - 0.05 * progress
-        return lambda_ce, lambda_kd, mu_nmse, nu_cc
-
-    # Extract features from pre-GAP layer
     model.get_feat = "pre_GAP"
     origin_model.get_feat = "pre_GAP"
 
-    model.cuda().train()
-    origin_model.cuda().eval()
-
+    torch.cuda.empty_cache()
     iter_nums = 0
     finish = False
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
 
     while not finish:
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+
         for batch_idx, (data, target) in enumerate(train_loader):
             iter_nums += 1
             if iter_nums > args.epoch:
                 finish = True
                 break
 
-            # sanitize inputs
-            if isinstance(data, torch.Tensor):
-                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
-            else:
-                data = safe_to_device(data)
+            # Filter data for target classes
+            mask = torch.tensor(
+                [t in target_classes for t in target], device=data.device
+            )
+            if not mask.any():
+                continue
 
-            target = target.cuda()
-            data_time.update(time.time() - end)
+            data = data[mask].cuda()
+            target = target[mask].cuda()
 
             with torch.no_grad():
                 t_logits, t_features = origin_model(data)
+                t_probs = nn.functional.softmax(t_logits / 1.0, dim=1)
 
-            # check teacher features
-            if not assert_finite("t_features", t_features):
-                print(f"[batch {iter_nums}] skipping: teacher features non-finite")
-                torch.cuda.empty_cache()
-                continue
-
+            optimizer.zero_grad()
             s_logits, s_features = model(data)
-            # check student features
-            if not assert_finite("s_features", s_features):
-                print(f"[batch {iter_nums}] skipping: student features non-finite")
-                torch.cuda.empty_cache()
-                continue
-            if not assert_finite("s_logits", s_logits):
-                print(f"[batch {iter_nums}] skipping: student logits non-finite")
-                torch.cuda.empty_cache()
-                continue
 
-            ce_loss = ce_criterion(s_logits, target)
-            if not assert_finite("ce_loss", ce_loss):
-                print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
-                torch.cuda.empty_cache()
-                continue
+            # Feature matching loss
+            feat_loss = criterion(s_features, t_features)
 
-            # Adaptive temperature
-            progress = iter_nums / args.epoch
-            temperature = base_temperature * (1.0 - 0.3 * progress)
+            # Classification loss with higher weight for target classes
+            # cls_loss = cls_criterion(s_logits, target)
 
-            # Soft target KD loss with temperature scaling
-            t_soft = F.softmax(t_logits / temperature, dim=1)
-            s_soft = F.log_softmax(s_logits / temperature, dim=1)
-            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
+            # Combined loss with higher weight for classification
+            loss = feat_loss
 
-            if not assert_finite("kd_soft_loss", kd_soft_loss):
-                print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
-                torch.cuda.empty_cache()
-                continue
+            losses.update(loss.item(), data.size(0))
 
-            l_ins = nmse_loss(s_features, t_features)
-            if problematic_classes is None:
-                l_cla = nmse_loss(s_features.T, t_features.T)
-                cc_s = class_correlation_matrix(s_features)
-                cc_t = class_correlation_matrix(t_features)
-                cc_loss = torch.mean((cc_s - cc_t) ** 2)
-            else:
-                l_cla, cc_loss = compute_focused_class_losses(
-                    s_features, t_features, target, problematic_classes
-                )
-
-            # Get adaptive loss weights
-            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums, args.epoch)
-
-            kd_feature_loss = l_ins + l_cla
-            total_loss = (lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss) / accumulation_steps
-
-            if not assert_finite("total_loss", total_loss):
-                print(f"[batch {iter_nums}] skipping: total_loss non-finite")
-                torch.cuda.empty_cache()
-                continue
-
-            try:
-                total_loss.backward()
-
-                # Step optimizer every accumulation_steps
-                if batch_idx % accumulation_steps == 0:
-                    # gradient clipping
-                    torch.nn.utils.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
-            except RuntimeError as e:
-                print(f"[batch {iter_nums}] backward failed: {e}")
-                torch.cuda.empty_cache()
-                optimizer.zero_grad()
-                continue
-
-            losses.update(total_loss.item() * accumulation_steps, data.size(0))
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            # Clear cache periodically
-            if iter_nums % 20 == 0:
-                torch.cuda.empty_cache()
+            loss.backward()
+            optimizer.step()
 
             if iter_nums % 50 == 0:
                 print(
-                    f"Train: [{iter_nums}/{args.epoch}]\t"
-                    f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                    f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})\t"
-                    f"Temp {temperature:.2f}"
+                    "Focused Train: [{0}/{1}]\t"
+                    "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    "Loss {losses.val:.4f} ({losses.avg:.4f})".format(
+                        iter_nums,
+                        args.epoch,
+                        batch_time=batch_time,
+                        data_time=data_time,
+                        losses=losses,
+                    )
                 )
+
+            if iter_nums % 400 == 0:
+                _, acc, _, _ = metric(metric_loader, model, origin_model)
+                print(f"Current Accuracy: {acc:.4f}")
+                model.train()
+
+    return model
+
+
+def log_model_parameters(model, model_name="Model", log_file="model_parameters.log"):
+    # Check for existing files and increment the file name if necessary
+    base_name, ext = os.path.splitext(log_file)
+    counter = 1
+    while os.path.exists(log_file):
+        log_file = f"{base_name}_{counter}{ext}"
+        counter += 1
+
+    # Set PyTorch print options to display all elements
+    torch.set_printoptions(
+        edgeitems=None, linewidth=1000, sci_mode=False, threshold=float("inf")
+    )
+
+    with open(log_file, "a") as f:  # Open the log file in append mode
+        f.write(f"Parameters of {model_name}:\n")
+        for name, param in model.named_parameters():
+            f.write(
+                f"  {name} -> Shape: {param.shape}, Requires Grad: {param.requires_grad}\n"
+            )
+            f.write(f"{param}\n")  # Logs the full tensor data
+        total_params = sum(p.numel() for p in model.parameters())
+        f.write(f"Total Parameters in {model_name}: {total_params}\n\n")
+
+    # Optionally, reset print options to default after logging
+    torch.set_printoptions(edgeitems=3, linewidth=80, sci_mode=None, threshold=1000)
+
+    print(f"Parameters logged in {log_file}")
+
+
+def example_batchnorm_gamma_analysis(model):
+    """
+    Example function showing how to use the BatchNorm gamma analysis functions.
+
+    Args:
+        model: PyTorch ResNet model
+    """
+    print("Example: Analyzing BatchNorm Gamma Values")
+    print("=" * 50)
+
+    # Method 1: Get raw gamma values
+    print("\n1. Getting raw gamma values...")
+    gamma_values = get_batchnorm_gamma_values(model)
+    print(f"Found {len(gamma_values)} BatchNorm layers")
+
+    # Method 2: Print summary
+    print("\n2. Printing summary...")
+    print_batchnorm_gamma_summary(model)
+
+    # Method 3: Save to file
+    print("\n3. Saving to file...")
+    filename = save_batchnorm_gamma_to_file(model)
+
+    # Method 4: Create visualizations
+    print("\n4. Creating visualizations...")
+    analysis_results = analyze_batchnorm_gamma_distribution(model, save_plot=True)
+
+    # Method 5: Access specific layer gamma values
+    print("\n5. Accessing specific layer gamma values...")
+    if gamma_values:
+        # Get the first BatchNorm layer as an example
+        first_bn_name = list(gamma_values.keys())[0]
+        first_bn_data = gamma_values[first_bn_name]
+        print(f"First BatchNorm layer: {first_bn_name}")
+        print(f"  Gamma values shape: {first_bn_data['gamma_values'].shape}")
+        print(f"  Mean gamma: {first_bn_data['mean_gamma']:.4f}")
+        print(f"  First 5 gamma values: {first_bn_data['gamma_values'][:5]}")
+
+    return gamma_values, analysis_results
+
+
+def measure_taylor_saliency_per_block(
+    model, data_loader, num_batches=10, device="cuda"
+):
+    """
+    Compute Taylor expansion-based saliency score per residual block.
+
+    The first-order Taylor approximation of loss change when a block's weights
+    are zeroed is: sum(|w_i * grad_i|) over all parameters in the block.
+
+    This measures how much the loss would change if the block were removed.
+    Higher score => more important block (larger loss change if removed).
+
+    Args:
+        model: PyTorch model (e.g., ResNet)
+        data_loader: DataLoader yielding (images, labels)
+        num_batches: Number of batches to use for estimation
+        device: 'cuda' or 'cpu'
+
+    Returns:
+        OrderedDict: {block_name: taylor_saliency_score}
+    """
+    model.eval()  # keep BN/Dropout deterministic; gradients still computed
+    if device:
+        model.to(device)
+
+    # Collect residual block names in order
+    block_names = []
+    for name, module in model.named_modules():
+        if isinstance(module, (BasicBlock, Bottleneck)):
+            blk = ".".join(name.split(".")[:2])
+            if blk not in block_names:
+                block_names.append(blk)
+
+    saliency_sums = collections.OrderedDict((bn, 0.0) for bn in block_names)
+    sample_count = 0
+
+    batch_idx = 0
+    for images, targets in data_loader:
+        if batch_idx >= num_batches:
+            break
+        batch_idx += 1
+
+        if device:
+            images = images.to(device)
+            targets = targets.to(device)
+
+        model.zero_grad(set_to_none=True)
+
+        # Forward pass
+        outputs = model(images)
+        logits = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+
+        # Use cross-entropy loss for classification
+        criterion = nn.CrossEntropyLoss()
+        loss = criterion(logits, targets)
+
+        # Backward pass to compute gradients
+        loss.backward()
+
+        # Compute Taylor saliency: sum(|w_i * grad_i|) per block
+        for pname, p in model.named_parameters():
+            if p.grad is None:
+                continue
+
+            # Identify which block this parameter belongs to
+            parts = pname.split(".")
+            blk = None
+            if len(parts) >= 2 and parts[0].startswith("layer"):
+                blk = parts[0] + "." + parts[1]
+
+            if blk is None or blk not in saliency_sums:
+                continue
+
+            # Taylor saliency: |weight * gradient|
+            saliency = torch.abs(p.data * p.grad.detach()).sum().item()
+            saliency_sums[blk] += saliency
+
+        sample_count += images.size(0)
+
+    # Average per sample processed
+    if sample_count > 0:
+        for k in saliency_sums:
+            saliency_sums[k] = saliency_sums[k] / sample_count
+
+    return saliency_sums

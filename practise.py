@@ -418,10 +418,164 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     )
 
     recover_time = time.time()
-    train(train_loader, optimizer, prune_model, origin_model, args, scheduler, warmup_epochs)
+    # Use frequency-adaptive training
+    train_with_frequency_filtering(train_loader, optimizer, prune_model, origin_model, args, scheduler, warmup_epochs)
     print(
         "compute recoverability {} takes {}s".format(
             rm_blocks, time.time() - recover_time
+
+
+def train_with_frequency_filtering(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
+    """Training with frequency domain filtering and adaptive augmentation"""
+    from frequency_filter import FrequencyFilter, AdaptiveNoiseInjection, SpectralNormalization, compute_difficulty_score
+    
+    end = time.time()
+    criterion = torch.nn.MSELoss(reduction="mean")
+    noise_injector = AdaptiveNoiseInjection(noise_std=0.03)
+
+    # Switch to train mode
+    origin_model.cuda()
+    origin_model.eval()
+    model.cuda()
+    model.eval()
+    model.get_feat = "pre_GAP"
+    origin_model.get_feat = "pre_GAP"
+
+    accumulation_steps = 2
+    torch.cuda.empty_cache()
+    iter_nums = 0
+    finish = False
+    
+    while not finish:
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        
+        for batch_idx, (data, target) in enumerate(train_loader):
+            iter_nums += 1
+            if iter_nums > args.epoch:
+                finish = True
+                break
+            
+            data_time.update(time.time() - end)
+            
+            # Sanitize inputs
+            if isinstance(data, torch.Tensor):
+                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
+            else:
+                data = safe_to_device(data)
+                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # Get teacher features first
+            with torch.no_grad():
+                t_output, t_features = origin_model(data)
+                
+                # Compute difficulty score
+                s_output_temp, _ = model(data)
+                difficulty = compute_difficulty_score(s_output_temp, t_output, target)
+
+            # Apply frequency filtering based on training progress
+            progress = iter_nums / args.epoch
+            
+            if progress < 0.3:
+                # Early stage: strong low-pass filtering for stability
+                filtered_data = FrequencyFilter.low_pass_filter(data, cutoff_ratio=0.5)
+            elif progress < 0.7:
+                # Mid stage: adaptive mixing
+                filtered_data = FrequencyFilter.adaptive_frequency_mix(data, t_features, alpha=0.6)
+            else:
+                # Late stage: spectral normalization + light filtering
+                filtered_data = SpectralNormalization.spectral_normalize(data)
+                filtered_data = FrequencyFilter.low_pass_filter(filtered_data, cutoff_ratio=0.7)
+            
+            # Add adaptive noise for robustness
+            augmented_data = noise_injector(filtered_data, difficulty)
+            
+            # Check filtered data
+            if not assert_finite("augmented_data", augmented_data):
+                print("Skipping batch due to non-finite filtered data")
+                continue
+
+            # Get teacher features with filtered data
+            with torch.no_grad():
+                _, t_features_filtered = origin_model(augmented_data)
+                if not assert_finite("t_features_filtered", t_features_filtered):
+                    print("Skipping batch due to non-finite teacher features")
+                    continue
+
+            # Student forward with filtered data
+            output, s_features = model(augmented_data)
+            
+            if not assert_finite("s_features", s_features):
+                print("Skipping batch due to non-finite student features")
+                continue
+
+            # Multi-scale feature loss
+            loss = criterion(s_features, t_features_filtered)
+            
+            # Add original feature alignment loss with lower weight
+            with torch.no_grad():
+                _, t_features_orig = origin_model(data)
+            _, s_features_orig = model(data)
+            loss_orig = criterion(s_features_orig, t_features_orig)
+            
+            # Combined loss: filtered (0.7) + original (0.3)
+            total_loss = 0.7 * loss + 0.3 * loss_orig
+            
+            if not assert_finite("total_loss", total_loss):
+                print("Skipping batch due to non-finite loss")
+                continue
+
+            # Normalize loss by accumulation steps
+            total_loss = total_loss / accumulation_steps
+            losses.update(total_loss.data.item() * accumulation_steps, augmented_data.size(0))
+
+            try:
+                total_loss.backward()
+
+                # Only step optimizer every accumulation_steps
+                if (batch_idx + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    # Learning rate warmup and scheduling
+                    if warmup_epochs > 0 and iter_nums <= warmup_epochs:
+                        lr = args.lr * (iter_nums / warmup_epochs)
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = lr
+                    elif scheduler is not None and iter_nums > warmup_epochs:
+                        scheduler.step()
+            except Exception as e:
+                print("Backward/step failed:", e)
+                torch.cuda.empty_cache()
+                continue
+            
+            # Measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+            
+            if iter_nums % 50 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(
+                    "FreqTrain: [{0}/{1}]\t"
+                    "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
+                    "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
+                    "Loss {losses.val:.4f} ({losses.avg:.4f})\t"
+                    "LR {lr:.6f}\t"
+                    "Progress {prog:.1%}".format(
+                        iter_nums,
+                        args.epoch,
+                        batch_time=batch_time,
+                        data_time=data_time,
+                        losses=losses,
+                        lr=current_lr,
+                        prog=progress,
+                    )
+                )
+
         )
     )
 

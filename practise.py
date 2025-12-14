@@ -30,7 +30,7 @@ from past_src.Grasp import GraSP, compute_importance_resnet
 from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
-from novel_method import MSFAMTrainer, train_with_msfam
+from novel_method import EnhancedContrastiveTrainer, train_with_enhanced_contrastive
 
 
 class ModelEMA:
@@ -61,7 +61,7 @@ from past_src.Grasp import GraSP, compute_importance_resnet
 from models.resnet import load_rm_block_state_dict
 from past_src.distill_data import DistillData
 from past_src.generate_data import arg_parse
-from novel_method import MSFAMTrainer, train_with_msfam
+from novel_method import EnhancedContrastiveTrainer, train_with_enhanced_contrastive
 
 
 def assert_finite(name, tensor):

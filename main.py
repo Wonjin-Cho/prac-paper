@@ -188,8 +188,8 @@ def main():
     args.gpu_id = "0"
     args.dataset = "fakenet"
     args.batch_size = 64
-    args.use_msfam = True  # Use Progressive Block Recovery (Hybrid method)
-    args.training_method = 'hybrid'  # Hybrid: contrastive + attention + adaptive KD
+    args.use_msfam = True  # Use Dual-Stage Contrastive-Attention (DSCA)
+    args.training_method = 'dsca'  # Two-stage: contrastive then attention
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 

@@ -2,256 +2,258 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import copy
+import numpy as np
+from scipy.stats import wasserstein_distance
 
 
-class MomentumEncoder:
-    """Momentum-updated teacher encoder for stable contrastive targets"""
-    def __init__(self, teacher_model, momentum=0.996):
-        self.momentum = momentum
-        self.teacher = teacher_model
-        
-    @torch.no_grad()
-    def update(self, student_model):
-        """Update momentum encoder with student parameters"""
-        for teacher_param, student_param in zip(self.teacher.parameters(), student_model.parameters()):
-            teacher_param.data = self.momentum * teacher_param.data + (1 - self.momentum) * student_param.data
-
-
-class HardNegativeContrastiveLoss(nn.Module):
-    """Contrastive loss with hard negative mining for few-shot learning"""
-    def __init__(self, temperature=0.07, hard_negative_weight=2.0):
+class MultiScaleFeatureExtractor(nn.Module):
+    """Extract features at multiple scales from the model"""
+    def __init__(self, model, layer_names):
         super().__init__()
-        self.temperature = temperature
-        self.hard_negative_weight = hard_negative_weight
+        self.model = model
+        self.layer_names = layer_names
+        self.features = {}
+        self.hooks = []
+        
+        for name, module in model.named_modules():
+            if name in layer_names:
+                hook = module.register_forward_hook(self.save_feature(name))
+                self.hooks.append(hook)
+    
+    def save_feature(self, name):
+        def hook(module, input, output):
+            self.features[name] = output
+        return hook
+    
+    def forward(self, x):
+        self.features.clear()
+        _ = self.model(x)
+        return self.features
+    
+    def remove_hooks(self):
+        for hook in self.hooks:
+            hook.remove()
+
+
+class WassersteinFeatureLoss(nn.Module):
+    """Wasserstein distance-based feature alignment"""
+    def __init__(self, num_samples=100):
+        super().__init__()
+        self.num_samples = num_samples
     
     def forward(self, student_feat, teacher_feat):
-        batch_size = student_feat.size(0)
+        # Flatten spatial dimensions
+        bs, c, h, w = student_feat.shape
+        student_flat = student_feat.view(bs, c, -1)
+        teacher_flat = teacher_feat.view(bs, c, -1)
         
-        # Flatten and normalize
-        student_feat = F.normalize(student_feat.view(batch_size, -1), dim=1)
-        teacher_feat = F.normalize(teacher_feat.view(batch_size, -1), dim=1)
-        
-        # Compute similarity matrix: [batch_size, batch_size]
-        logits = torch.mm(student_feat, teacher_feat.t()) / self.temperature
-        
-        # Positive pairs are on the diagonal
-        labels = torch.arange(batch_size).to(student_feat.device)
-        
-        # Hard negative mining: identify hardest negatives per sample
-        with torch.no_grad():
-            # Mask out positive pairs (diagonal)
-            mask = torch.eye(batch_size, dtype=torch.bool, device=logits.device)
-            negative_logits = logits.masked_fill(mask, float('-inf'))
+        # Compute channel-wise Wasserstein distance
+        loss = 0
+        for i in range(min(c, self.num_samples)):
+            s_dist = student_flat[:, i, :].flatten().detach().cpu().numpy()
+            t_dist = teacher_flat[:, i, :].flatten().detach().cpu().numpy()
             
-            # Find hardest negatives (highest similarity among negatives)
-            hard_negatives = negative_logits.max(dim=1)[0]
+            # Sample for efficiency
+            if len(s_dist) > 1000:
+                indices = np.random.choice(len(s_dist), 1000, replace=False)
+                s_dist = s_dist[indices]
+                t_dist = t_dist[indices]
+            
+            loss += wasserstein_distance(s_dist, t_dist)
         
-        # Standard contrastive loss
-        base_loss = F.cross_entropy(logits, labels)
-        
-        # Hard negative loss: additional penalty for hard negatives
-        # We want to push hard negatives further away
-        positive_logits = logits[torch.arange(batch_size), labels]
-        hard_negative_loss = F.relu(hard_negatives - positive_logits + 0.5).mean()
-        
-        total_loss = base_loss + self.hard_negative_weight * hard_negative_loss
-        
-        return total_loss, base_loss, hard_negative_loss
+        return torch.tensor(loss / min(c, self.num_samples), device=student_feat.device)
 
 
-class EnhancedContrastiveTrainer:
-    """Enhanced Contrastive Knowledge Distillation with Momentum Encoder and Hard Negative Mining"""
-    def __init__(self, student_model, teacher_model, rm_blocks=None, num_classes=1000, device='cuda'):
+class AdaptiveUncertaintyMixup:
+    """Mixup based on feature uncertainty from teacher model"""
+    def __init__(self, teacher_model, alpha=1.0):
+        self.teacher_model = teacher_model
+        self.alpha = alpha
+    
+    def compute_uncertainty(self, images):
+        """Compute prediction uncertainty using entropy"""
+        with torch.no_grad():
+            logits = self.teacher_model(images)
+            probs = F.softmax(logits, dim=1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
+        return entropy
+    
+    def __call__(self, images, labels):
+        batch_size = images.size(0)
+        
+        # Compute uncertainty for each sample
+        uncertainty = self.compute_uncertainty(images)
+        
+        # Generate mixup weights based on uncertainty
+        # High uncertainty samples get lower mixing weights
+        weights = torch.softmax(-uncertainty, dim=0)
+        
+        # Create mixup pairs based on uncertainty
+        indices = torch.randperm(batch_size)
+        mixed_images = images.clone()
+        mixed_labels = labels.clone()
+        
+        for i in range(batch_size):
+            # Lambda from beta distribution, modulated by uncertainty
+            lam = np.random.beta(self.alpha, self.alpha)
+            lam = lam * (1 - weights[i].item())  # Reduce mixing for uncertain samples
+            
+            mixed_images[i] = lam * images[i] + (1 - lam) * images[indices[i]]
+            mixed_labels[i] = lam * labels[i] + (1 - lam) * labels[indices[i]]
+        
+        return mixed_images, mixed_labels
+
+
+class MSFAMTrainer:
+    """Multi-Scale Feature Alignment with Adaptive Mixup Trainer"""
+    def __init__(self, student_model, teacher_model, device='cuda'):
         self.student = student_model.to(device)
         self.teacher = teacher_model.to(device)
         self.device = device
-        self.num_classes = num_classes
-        self.rm_blocks = rm_blocks if rm_blocks else []
         
-        # Create momentum encoder
-        self.momentum_encoder = MomentumEncoder(self.teacher, momentum=0.996)
+        # Extract layer names for multi-scale features
+        self.layer_names = self._get_layer_names()
+        
+        # Feature extractors
+        self.student_extractor = MultiScaleFeatureExtractor(
+            self.student, self.layer_names
+        )
+        self.teacher_extractor = MultiScaleFeatureExtractor(
+            self.teacher, self.layer_names
+        )
         
         # Loss functions
-        self.contrastive_loss_fn = HardNegativeContrastiveLoss(
-            temperature=0.07,
-            hard_negative_weight=1.5
-        )
+        self.wasserstein_loss = WassersteinFeatureLoss()
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')
         self.ce_loss = nn.CrossEntropyLoss()
         
+        # Adaptive mixup
+        self.mixup = AdaptiveUncertaintyMixup(self.teacher)
+        
         self.teacher.eval()
     
-    def train_step(self, images, labels, optimizer, epoch, total_epochs):
-        """Training step with enhanced contrastive learning"""
+    def _get_layer_names(self):
+        """Get names of key layers for feature extraction"""
+        layer_names = []
+        for name, module in self.student.named_modules():
+            if isinstance(module, nn.Conv2d) and 'downsample' not in name:
+                if any(f'layer{i}' in name for i in range(1, 5)):
+                    # Extract one layer per block
+                    if name.endswith('.conv2'):
+                        layer_names.append(name)
+        return layer_names[:8]  # Limit to 8 layers for efficiency
+    
+    def compute_feature_alignment_loss(self, images):
+        """Compute multi-scale feature alignment loss"""
+        student_features = self.student_extractor(images)
+        
+        with torch.no_grad():
+            teacher_features = self.teacher_extractor(images)
+        
+        feature_loss = 0
+        for layer_name in self.layer_names:
+            if layer_name in student_features and layer_name in teacher_features:
+                s_feat = student_features[layer_name]
+                t_feat = teacher_features[layer_name]
+                
+                # L2 loss
+                l2_loss = F.mse_loss(s_feat, t_feat)
+                
+                # Wasserstein loss (computed periodically for efficiency)
+                if np.random.random() < 0.1:  # 10% of the time
+                    w_loss = self.wasserstein_loss(s_feat, t_feat)
+                else:
+                    w_loss = 0
+                
+                feature_loss += l2_loss + 0.01 * w_loss
+        
+        return feature_loss / len(self.layer_names)
+    
+    def train_step(self, images, labels, optimizer, use_mixup=True):
+        """Single training step"""
         self.student.train()
         
         images = images.to(self.device)
         labels = labels.to(self.device)
         
-        # Set feature extraction mode
-        self.student.get_feat = 'pre_GAP'
-        self.teacher.get_feat = 'pre_GAP'
+        # Apply adaptive mixup
+        if use_mixup:
+            images, labels = self.mixup(images, labels)
         
-        # Forward pass
-        student_logits, student_feat = self.student(images)
+        optimizer.zero_grad()
         
+        # Student predictions
+        student_logits = self.student(images)
+        
+        # Teacher predictions
         with torch.no_grad():
-            teacher_logits, teacher_feat = self.teacher(images)
+            teacher_logits = self.teacher(images)
         
-        # Adaptive loss weights based on training progress
-        progress = epoch / total_epochs
-        
-        # Gradually shift from KD to contrastive learning
-        if progress < 0.3:
-            # Early stage: focus on KD for basic knowledge transfer
-            lambda_ce = 0.25
-            lambda_kd = 0.50
-            lambda_contrast = 0.25
-        elif progress < 0.7:
-            # Middle stage: balance between KD and contrastive
-            lambda_ce = 0.20
-            lambda_kd = 0.40
-            lambda_contrast = 0.40
-        else:
-            # Late stage: focus on contrastive for fine-grained alignment
-            lambda_ce = 0.15
-            lambda_kd = 0.30
-            lambda_contrast = 0.55
-        
-        # 1. Classification loss
-        ce_loss = self.ce_loss(student_logits, labels)
-        
-        # 2. Knowledge Distillation loss with adaptive temperature
-        temperature = 4.0 * (1.0 - 0.2 * progress)  # Temperature annealing
+        # Knowledge distillation loss
         kd_loss = self.kl_loss(
-            F.log_softmax(student_logits / temperature, dim=1),
-            F.softmax(teacher_logits / temperature, dim=1)
-        ) * (temperature ** 2)
+            F.log_softmax(student_logits / 3.0, dim=1),
+            F.softmax(teacher_logits / 3.0, dim=1)
+        ) * (3.0 ** 2)
         
-        # 3. Enhanced contrastive loss with hard negative mining
-        contrast_loss, base_contrast, hard_neg_loss = self.contrastive_loss_fn(
-            student_feat, teacher_feat
-        )
+        # Classification loss
+        if len(labels.shape) == 2:  # Soft labels from mixup
+            ce_loss = -torch.mean(torch.sum(labels * F.log_softmax(student_logits, dim=1), dim=1))
+        else:
+            ce_loss = self.ce_loss(student_logits, labels)
         
-        # Combined loss
-        total_loss = (
-            lambda_ce * ce_loss +
-            lambda_kd * kd_loss +
-            lambda_contrast * contrast_loss
-        )
+        # Feature alignment loss
+        feat_loss = self.compute_feature_alignment_loss(images)
+        
+        # Combined loss with adaptive weighting
+        total_loss = 0.5 * kd_loss + 0.3 * ce_loss + 0.2 * feat_loss
         
         total_loss.backward()
+        optimizer.step()
         
         return {
             'total_loss': total_loss.item(),
-            'ce_loss': ce_loss.item(),
             'kd_loss': kd_loss.item(),
-            'contrast_loss': contrast_loss.item(),
-            'base_contrast': base_contrast.item(),
-            'hard_neg_loss': hard_neg_loss.item(),
+            'ce_loss': ce_loss.item(),
+            'feat_loss': feat_loss.item()
         }
-    
-    def update_momentum_encoder(self):
-        """Update momentum encoder after optimizer step"""
-        self.momentum_encoder.update(self.student)
     
     def cleanup(self):
-        """Cleanup resources"""
-        torch.cuda.empty_cache()
+        """Remove hooks"""
+        self.student_extractor.remove_hooks()
+        self.teacher_extractor.remove_hooks()
 
 
-# Backward compatibility
-DSCATrainer = EnhancedContrastiveTrainer
-ProgressiveBlockRecoveryTrainer = EnhancedContrastiveTrainer
-SimplifiedMSFAMTrainer = EnhancedContrastiveTrainer
-EnhancedMSFAMTrainer = EnhancedContrastiveTrainer
-MSFAMTrainer = EnhancedContrastiveTrainer
-
-
-def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr=0.01, num_classes=1000, rm_blocks=None):
-    """Train student model using Enhanced Contrastive method with Hard Negative Mining and Momentum Encoder"""
+def train_with_msfam(student_model, teacher_model, train_loader, epochs=100, lr=0.01):
+    """Train student model using MSFAM method"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    trainer = EnhancedContrastiveTrainer(
-        student_model, teacher_model,
-        rm_blocks=rm_blocks, num_classes=num_classes, device=device
-    )
-    
-    # Optimizer with proper hyperparameters for few-shot setting
+    trainer = MSFAMTrainer(student_model, teacher_model, device)
     optimizer = torch.optim.SGD(
-        filter(lambda p: p.requires_grad, student_model.parameters()),
+        student_model.parameters(),
         lr=lr,
         momentum=0.9,
-        weight_decay=1e-4,
-        nesterov=True
+        weight_decay=1e-4
     )
-    
-    # Cosine annealing with warmup
-    warmup_epochs = int(0.05 * epochs)  # 5% warmup
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
     
     for epoch in range(epochs):
-        epoch_losses = {
-            'total_loss': 0,
-            'ce_loss': 0,
-            'kd_loss': 0,
-            'contrast_loss': 0,
-            'base_contrast': 0,
-            'hard_neg_loss': 0,
-        }
+        epoch_losses = {'total_loss': 0, 'kd_loss': 0, 'ce_loss': 0, 'feat_loss': 0}
         
         for batch_idx, (images, labels) in enumerate(train_loader):
-            # Warmup learning rate
-            if epoch < warmup_epochs:
-                lr_scale = (epoch * len(train_loader) + batch_idx + 1) / (warmup_epochs * len(train_loader))
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = lr * lr_scale
+            losses = trainer.train_step(images, labels, optimizer, use_mixup=True)
             
-            losses = trainer.train_step(images, labels, optimizer, epoch, epochs)
-            
-            # Accumulate losses
             for key in epoch_losses:
-                if key in losses:
-                    epoch_losses[key] += losses[key]
-            
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, student_model.parameters()),
-                max_norm=5.0
-            )
-            
-            optimizer.step()
-            optimizer.zero_grad()
-            
-            # Update momentum encoder after each batch
-            trainer.update_momentum_encoder()
-            
-            # Clear cache periodically
-            if batch_idx % 20 == 0:
-                torch.cuda.empty_cache()
+                epoch_losses[key] += losses[key]
         
-        # Step scheduler after warmup
-        if epoch >= warmup_epochs:
-            scheduler.step()
+        scheduler.step()
         
-        # Calculate epoch averages
+        # Print epoch statistics
         for key in epoch_losses:
             epoch_losses[key] /= len(train_loader)
         
-        # Print epoch statistics
-        if (epoch + 1) % 50 == 0:
-            print(f"\nEpoch {epoch+1}/{epochs}")
-            print(f"  Total: {epoch_losses['total_loss']:.4f} | CE: {epoch_losses['ce_loss']:.4f}")
-            print(f"  KD: {epoch_losses['kd_loss']:.4f} | Contrast: {epoch_losses['contrast_loss']:.4f}")
-            print(f"  Base Contrast: {epoch_losses['base_contrast']:.4f} | Hard Neg: {epoch_losses['hard_neg_loss']:.4f}")
-            print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs} - " + 
+                  " - ".join([f"{k}: {v:.4f}" for k, v in epoch_losses.items()]))
     
     trainer.cleanup()
     return student_model
-
-
-# Keep simplified version as backup
-train_with_simplified_msfam = train_with_msfam

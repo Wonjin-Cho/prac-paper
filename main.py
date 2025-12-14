@@ -188,8 +188,8 @@ def main():
     args.gpu_id = "0"
     args.dataset = "fakenet"
     args.batch_size = 64  # Ensure consistent batch size
-    args.use_msfam = True  # Set to True to use enhanced MSFAM novel training method
-    args.training_method = 'clkd'  # Options: 'clkd', 'mmd', 'attention', 'contrastive', 'combined', 'mspr', or set use_msfam=True
+    args.use_msfam = True  # Set to True to use enhanced MSFAM novel training method with progressive learning
+    args.training_method = 'clkd'  # Options: 'clkd', 'mmd', 'attention', 'contrastive', or set use_msfam=True (recommended)
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 

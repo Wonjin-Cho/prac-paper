@@ -425,10 +425,10 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     if hasattr(args, 'use_msfam') and args.use_msfam:
         print("Using Enhanced MSFAM method (Multi-Scale Feature Alignment with Adaptive Mixup)")
         from novel_method import SimplifiedMSFAMTrainer
-        
+
         # Create trainer with rm_blocks info
         trainer = SimplifiedMSFAMTrainer(prune_model, origin_model, rm_blocks=rm_blocks, num_classes=args.num_classes)
-        
+
         # Training loop
         iter_nums = 0
         finish = False
@@ -438,30 +438,30 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                 if iter_nums > args.epoch:
                     finish = True
                     break
-                
+
                 losses = trainer.train_step(
                     data, target, optimizer,
                     iter_nums, args.epoch
                 )
-                
+
                 # Clear cache to reduce memory usage
                 if iter_nums % 10 == 0:
                     torch.cuda.empty_cache()
-                
+
                 if iter_nums % 50 == 0:
                     print(f"Train: [{iter_nums}/{args.epoch}]\t"
                           f"Total Loss {losses['total_loss']:.4f}\t"
                           f"CE Loss {losses['ce_loss']:.4f}\t"
                           f"KD Loss {losses['kd_loss']:.4f}\t"
                           f"Feature Loss {losses['feat_loss']:.4f}")
-        
+
         trainer.cleanup()
     elif hasattr(args, 'training_method'):
         if args.training_method == 'alkd':
             print("Using ALKD-CR method (Adaptive Layer-wise KD with Channel Recalibration)")
             from novel_method_alkd import ALKDCRTrainer
             trainer = ALKDCRTrainer(prune_model, origin_model, rm_blocks)
-            
+
             # Add feature aligner parameters to optimizer
             all_params = trainer.get_trainable_parameters()
             if args.opt == "SGD":
@@ -472,7 +472,7 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                 optimizer = torch.optim.Adam(all_params, lr=args.lr, weight_decay=args.weight_decay)
             elif args.opt == "AdamW":
                 optimizer = torch.optim.AdamW(all_params, lr=args.lr, weight_decay=args.weight_decay)
-            
+
             # Training loop
             iter_nums = 0
             finish = False
@@ -482,13 +482,13 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     if iter_nums > args.epoch:
                         finish = True
                         break
-                    
+
                     losses = trainer.train_step(data, target, optimizer, iter_nums, args.epoch)
-                    
+
                     # Clear cache to reduce memory usage
                     if iter_nums % 10 == 0:
                         torch.cuda.empty_cache()
-                    
+
                     if iter_nums % 50 == 0:
                         print(f"Train: [{iter_nums}/{args.epoch}]\t"
                               f"Total Loss {losses['total_loss']:.4f}\t"
@@ -500,7 +500,7 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
             print("Using Combined KD method (MMD + Relation + Attention + Contrastive)")
             from novel_method_combined import CombinedKDTrainer
             trainer = CombinedKDTrainer(prune_model, origin_model)
-            
+
             # Training loop - similar format to other methods
             iter_nums = 0
             finish = False
@@ -510,13 +510,13 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     if iter_nums > args.epoch:
                         finish = True
                         break
-                    
+
                     losses = trainer.train_step(data, target, optimizer)
-                    
+
                     # Clear cache to reduce memory usage
                     if iter_nums % 10 == 0:
                         torch.cuda.empty_cache()
-                    
+
                     if iter_nums % 50 == 0:
                         print(f"Train: [{iter_nums}/{args.epoch}]\t"
                               f"Total Loss {losses['total_loss']:.4f}\t"
@@ -559,7 +559,7 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                 lr=0.001,
                 betas=(0.5, 0.999)
             )
-            
+
             # Training loop - similar format to train_clkd
             iter_nums = 0
             finish = False
@@ -569,16 +569,16 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
                     if iter_nums > args.epoch:
                         finish = True
                         break
-                    
+
                     losses = trainer.train_step(
                         data, target, optimizer, disc_optimizer,
                         iter_nums, args.epoch, use_augmentation=True
                     )
-                    
+
                     # Clear cache to reduce memory usage
                     if iter_nums % 10 == 0:
                         torch.cuda.empty_cache()
-                    
+
                     if iter_nums % 50 == 0:
                         print(f"Train: [{iter_nums}/{args.epoch}]\t"
                               f"Total Loss {losses['total_loss']:.4f}\t"
@@ -802,21 +802,26 @@ def train_clkd(
     # Adaptive loss weights with warmup
     warmup_epochs = int(0.1 * args.epoch)
 
-    # Temperature for knowledge distillation
-    temperature = 4.0
+    # Gradient accumulation
+    accumulation_steps = 2
 
-    def get_loss_weights(current_iter):
+    # Temperature for knowledge distillation
+    base_temperature = 4.0
+
+    def get_loss_weights(current_iter, total_iters):
+        progress = current_iter / total_iters
         if current_iter < warmup_epochs:
             alpha = current_iter / warmup_epochs
-            lambda_ce = 0.2 + 0.1 * alpha
-            lambda_kd = 0.3 + 0.2 * alpha
-            mu_nmse = 0.3 + 0.2 * alpha
-            nu_cc = 0.05 + 0.15 * alpha
+            lambda_ce = 0.15 + 0.1 * alpha
+            lambda_kd = 0.35 + 0.15 * alpha
+            mu_nmse = 0.35 + 0.15 * alpha
+            nu_cc = 0.05 + 0.1 * alpha
         else:
-            lambda_ce = 0.2
+            # Gradually shift weight to KD and CE
+            lambda_ce = 0.2 + 0.05 * progress
             lambda_kd = 0.5
-            mu_nmse = 0.4
-            nu_cc = 0.2
+            mu_nmse = 0.35 - 0.1 * progress
+            nu_cc = 0.15 - 0.05 * progress
         return lambda_ce, lambda_kd, mu_nmse, nu_cc
 
     # Extract features from pre-GAP layer
@@ -854,21 +859,29 @@ def train_clkd(
             # check teacher features
             if not assert_finite("t_features", t_features):
                 print(f"[batch {iter_nums}] skipping: teacher features non-finite")
+                torch.cuda.empty_cache()
                 continue
 
             s_logits, s_features = model(data)
             # check student features
             if not assert_finite("s_features", s_features):
                 print(f"[batch {iter_nums}] skipping: student features non-finite")
+                torch.cuda.empty_cache()
                 continue
             if not assert_finite("s_logits", s_logits):
                 print(f"[batch {iter_nums}] skipping: student logits non-finite")
+                torch.cuda.empty_cache()
                 continue
 
             ce_loss = ce_criterion(s_logits, target)
             if not assert_finite("ce_loss", ce_loss):
                 print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
+                torch.cuda.empty_cache()
                 continue
+
+            # Adaptive temperature
+            progress = iter_nums / args.epoch
+            temperature = base_temperature * (1.0 - 0.3 * progress)
 
             # Soft target KD loss with temperature scaling
             t_soft = F.softmax(t_logits / temperature, dim=1)
@@ -877,6 +890,7 @@ def train_clkd(
 
             if not assert_finite("kd_soft_loss", kd_soft_loss):
                 print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
+                torch.cuda.empty_cache()
                 continue
 
             l_ins = nmse_loss(s_features, t_features)
@@ -891,381 +905,46 @@ def train_clkd(
                 )
 
             # Get adaptive loss weights
-            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
+            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums, args.epoch)
 
             kd_feature_loss = l_ins + l_cla
-            total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
+            total_loss = (lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss) / accumulation_steps
 
             if not assert_finite("total_loss", total_loss):
                 print(f"[batch {iter_nums}] skipping: total_loss non-finite")
-                continue
-
-            optimizer.zero_grad()
-            try:
-                # enable anomaly detection around backward to get op stack if needed
-                with torch.autograd.set_detect_anomaly(True):
-                    total_loss.backward()
-                # gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
-                )
-                optimizer.step()
-            except RuntimeError as e:
-                print(f"[batch {iter_nums}] backward failed: {e}")
-                # optionally save offending batch for inspection
-                try:
-                    torch.save(
-                        {"data": data.detach().cpu(), "target": target.detach().cpu()},
-                        f"bad_batch_{iter_nums}.pt",
-                    )
-                    print(f"Saved bad batch bad_batch_{iter_nums}.pt")
-                except Exception:
-                    pass
                 torch.cuda.empty_cache()
                 continue
 
-            losses.update(total_loss.item(), data.size(0))
+            try:
+                total_loss.backward()
+
+                # Step optimizer every accumulation_steps
+                if batch_idx % accumulation_steps == 0:
+                    # gradient clipping
+                    torch.nn.utils.clip_grad_norm_(
+                        filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+            except RuntimeError as e:
+                print(f"[batch {iter_nums}] backward failed: {e}")
+                torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                continue
+
+            losses.update(total_loss.item() * accumulation_steps, data.size(0))
             batch_time.update(time.time() - end)
             end = time.time()
+
+            # Clear cache periodically
+            if iter_nums % 20 == 0:
+                torch.cuda.empty_cache()
 
             if iter_nums % 50 == 0:
                 print(
                     f"Train: [{iter_nums}/{args.epoch}]\t"
                     f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                     f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})"
-                )
-
-
-def nmse_loss(p, z):
-    p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)
-    z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-    return torch.mean((p_norm - z_norm) ** 2)
-
-
-def class_correlation_matrix(Z):
-    """
-    Z: [B, C] feature matrix (batch x channels)
-    returns: [C x C] class correlation matrix
-    """
-    Z = Z.view(Z.size(0), -1).contiguous()  # Flatten and ensure 2D [B, C]
-    Z_mean = Z.mean(dim=0, keepdim=True)  # [1, C]
-    Z_centered = Z - Z_mean  # [B, C]
-    return Z_centered.T @ Z_centered / (Z.size(0) - 1)
-
-
-def train_clkd(
-    train_loader,
-    metric_loader,
-    optimizer,
-    model,
-    origin_model,
-    args,
-    problematic_classes=None,
-):
-    end = time.time()
-    ce_criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    # Adaptive loss weights with warmup
-    warmup_epochs = int(0.1 * args.epoch)
-
-    # Temperature for knowledge distillation
-    temperature = 4.0
-
-    def get_loss_weights(current_iter):
-        if current_iter < warmup_epochs:
-            alpha = current_iter / warmup_epochs
-            lambda_ce = 0.2 + 0.1 * alpha
-            lambda_kd = 0.3 + 0.2 * alpha
-            mu_nmse = 0.3 + 0.2 * alpha
-            nu_cc = 0.05 + 0.15 * alpha
-        else:
-            lambda_ce = 0.2
-            lambda_kd = 0.5
-            mu_nmse = 0.4
-            nu_cc = 0.2
-        return lambda_ce, lambda_kd, mu_nmse, nu_cc
-
-    # Extract features from pre-GAP layer
-    model.get_feat = "pre_GAP"
-    origin_model.get_feat = "pre_GAP"
-
-    model.cuda().train()
-    origin_model.cuda().eval()
-
-    iter_nums = 0
-    finish = False
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-
-    while not finish:
-        for batch_idx, (data, target) in enumerate(train_loader):
-            iter_nums += 1
-            if iter_nums > args.epoch:
-                finish = True
-                break
-
-            # sanitize inputs
-            if isinstance(data, torch.Tensor):
-                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
-            else:
-                data = safe_to_device(data)
-
-            target = target.cuda()
-            data_time.update(time.time() - end)
-
-            with torch.no_grad():
-                t_logits, t_features = origin_model(data)
-
-            # check teacher features
-            if not assert_finite("t_features", t_features):
-                print(f"[batch {iter_nums}] skipping: teacher features non-finite")
-                continue
-
-            s_logits, s_features = model(data)
-            # check student features
-            if not assert_finite("s_features", s_features):
-                print(f"[batch {iter_nums}] skipping: student features non-finite")
-                continue
-            if not assert_finite("s_logits", s_logits):
-                print(f"[batch {iter_nums}] skipping: student logits non-finite")
-                continue
-
-            ce_loss = ce_criterion(s_logits, target)
-            if not assert_finite("ce_loss", ce_loss):
-                print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
-                continue
-
-            # Soft target KD loss with temperature scaling
-            t_soft = F.softmax(t_logits / temperature, dim=1)
-            s_soft = F.log_softmax(s_logits / temperature, dim=1)
-            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
-
-            if not assert_finite("kd_soft_loss", kd_soft_loss):
-                print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
-                continue
-
-            l_ins = nmse_loss(s_features, t_features)
-            if problematic_classes is None:
-                l_cla = nmse_loss(s_features.T, t_features.T)
-                cc_s = class_correlation_matrix(s_features)
-                cc_t = class_correlation_matrix(t_features)
-                cc_loss = torch.mean((cc_s - cc_t) ** 2)
-            else:
-                l_cla, cc_loss = compute_focused_class_losses(
-                    s_features, t_features, target, problematic_classes
-                )
-
-            # Get adaptive loss weights
-            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
-
-            kd_feature_loss = l_ins + l_cla
-            total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
-
-            if not assert_finite("total_loss", total_loss):
-                print(f"[batch {iter_nums}] skipping: total_loss non-finite")
-                continue
-
-            optimizer.zero_grad()
-            try:
-                # enable anomaly detection around backward to get op stack if needed
-                with torch.autograd.set_detect_anomaly(True):
-                    total_loss.backward()
-                # gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
-                )
-                optimizer.step()
-            except RuntimeError as e:
-                print(f"[batch {iter_nums}] backward failed: {e}")
-                # optionally save offending batch for inspection
-                try:
-                    torch.save(
-                        {"data": data.detach().cpu(), "target": target.detach().cpu()},
-                        f"bad_batch_{iter_nums}.pt",
-                    )
-                    print(f"Saved bad batch bad_batch_{iter_nums}.pt")
-                except Exception:
-                    pass
-                torch.cuda.empty_cache()
-                continue
-
-            losses.update(total_loss.item(), data.size(0))
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if iter_nums % 50 == 0:
-                print(
-                    f"Train: [{iter_nums}/{args.epoch}]\t"
-                    f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                    f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})"
-                )
-
-
-def nmse_loss(p, z):
-    p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)
-    z_norm = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-    return torch.mean((p_norm - z_norm) ** 2)
-
-
-def class_correlation_matrix(Z):
-    """
-    Z: [B, C] feature matrix (batch x channels)
-    returns: [C x C] class correlation matrix
-    """
-    Z = Z.view(Z.size(0), -1).contiguous()  # Flatten and ensure 2D [B, C]
-    Z_mean = Z.mean(dim=0, keepdim=True)  # [1, C]
-    Z_centered = Z - Z_mean  # [B, C]
-    return Z_centered.T @ Z_centered / (Z.size(0) - 1)
-
-
-def train_clkd(
-    train_loader,
-    metric_loader,
-    optimizer,
-    model,
-    origin_model,
-    args,
-    problematic_classes=None,
-):
-    end = time.time()
-    ce_criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-
-    # Adaptive loss weights with warmup
-    warmup_epochs = int(0.1 * args.epoch)
-
-    # Temperature for knowledge distillation
-    temperature = 4.0
-
-    def get_loss_weights(current_iter):
-        if current_iter < warmup_epochs:
-            alpha = current_iter / warmup_epochs
-            lambda_ce = 0.2 + 0.1 * alpha
-            lambda_kd = 0.3 + 0.2 * alpha
-            mu_nmse = 0.3 + 0.2 * alpha
-            nu_cc = 0.05 + 0.15 * alpha
-        else:
-            lambda_ce = 0.2
-            lambda_kd = 0.5
-            mu_nmse = 0.4
-            nu_cc = 0.2
-        return lambda_ce, lambda_kd, mu_nmse, nu_cc
-
-    # Extract features from pre-GAP layer
-    model.get_feat = "pre_GAP"
-    origin_model.get_feat = "pre_GAP"
-
-    model.cuda().train()
-    origin_model.cuda().eval()
-
-    iter_nums = 0
-    finish = False
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-
-    while not finish:
-        for batch_idx, (data, target) in enumerate(train_loader):
-            iter_nums += 1
-            if iter_nums > args.epoch:
-                finish = True
-                break
-
-            # sanitize inputs
-            if isinstance(data, torch.Tensor):
-                data = torch.nan_to_num(data, nan=0.0, posinf=1e6, neginf=-1e6).cuda()
-            else:
-                data = safe_to_device(data)
-
-            target = target.cuda()
-            data_time.update(time.time() - end)
-
-            with torch.no_grad():
-                t_logits, t_features = origin_model(data)
-
-            # check teacher features
-            if not assert_finite("t_features", t_features):
-                print(f"[batch {iter_nums}] skipping: teacher features non-finite")
-                continue
-
-            s_logits, s_features = model(data)
-            # check student features
-            if not assert_finite("s_features", s_features):
-                print(f"[batch {iter_nums}] skipping: student features non-finite")
-                continue
-            if not assert_finite("s_logits", s_logits):
-                print(f"[batch {iter_nums}] skipping: student logits non-finite")
-                continue
-
-            ce_loss = ce_criterion(s_logits, target)
-            if not assert_finite("ce_loss", ce_loss):
-                print(f"[batch {iter_nums}] skipping: ce_loss non-finite")
-                continue
-
-            # Soft target KD loss with temperature scaling
-            t_soft = F.softmax(t_logits / temperature, dim=1)
-            s_soft = F.log_softmax(s_logits / temperature, dim=1)
-            kd_soft_loss = F.kl_div(s_soft, t_soft, reduction='batchmean') * (temperature ** 2)
-
-            if not assert_finite("kd_soft_loss", kd_soft_loss):
-                print(f"[batch {iter_nums}] skipping: kd_soft_loss non-finite")
-                continue
-
-            l_ins = nmse_loss(s_features, t_features)
-            if problematic_classes is None:
-                l_cla = nmse_loss(s_features.T, t_features.T)
-                cc_s = class_correlation_matrix(s_features)
-                cc_t = class_correlation_matrix(t_features)
-                cc_loss = torch.mean((cc_s - cc_t) ** 2)
-            else:
-                l_cla, cc_loss = compute_focused_class_losses(
-                    s_features, t_features, target, problematic_classes
-                )
-
-            # Get adaptive loss weights
-            lambda_ce, lambda_kd, mu_nmse, nu_cc = get_loss_weights(iter_nums)
-
-            kd_feature_loss = l_ins + l_cla
-            total_loss = lambda_ce * ce_loss + lambda_kd * kd_soft_loss + mu_nmse * kd_feature_loss + nu_cc * cc_loss
-
-            if not assert_finite("total_loss", total_loss):
-                print(f"[batch {iter_nums}] skipping: total_loss non-finite")
-                continue
-
-            optimizer.zero_grad()
-            try:
-                # enable anomaly detection around backward to get op stack if needed
-                with torch.autograd.set_detect_anomaly(True):
-                    total_loss.backward()
-                # gradient clipping
-                torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, model.parameters()), max_norm=5.0
-                )
-                optimizer.step()
-            except RuntimeError as e:
-                print(f"[batch {iter_nums}] backward failed: {e}")
-                # optionally save offending batch for inspection
-                try:
-                    torch.save(
-                        {"data": data.detach().cpu(), "target": target.detach().cpu()},
-                        f"bad_batch_{iter_nums}.pt",
-                    )
-                    print(f"Saved bad batch bad_batch_{iter_nums}.pt")
-                except Exception:
-                    pass
-                torch.cuda.empty_cache()
-                continue
-
-            losses.update(total_loss.item(), data.size(0))
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if iter_nums % 50 == 0:
-                print(
-                    f"Train: [{iter_nums}/{args.epoch}]\t"
-                    f"Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                    f"Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                    f"Loss {losses.val:.4f} ({losses.avg:.4f})"
+                    f"Loss {losses.val:.4f} ({losses.avg:.4f})\t"
+                    f"Temp {temperature:.2f}"
                 )

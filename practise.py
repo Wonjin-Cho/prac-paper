@@ -578,8 +578,6 @@ def train_with_frequency_filtering(train_loader, optimizer, model, origin_model,
                     )
                 )
 
-        )
-    )
 
 
 def train(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):

@@ -423,6 +423,8 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
     print(
         "compute recoverability {} takes {}s".format(
             rm_blocks, time.time() - recover_time
+        )
+    )
 
 
 def train_with_frequency_filtering(train_loader, optimizer, model, origin_model, args, scheduler=None, warmup_epochs=0):
@@ -683,6 +685,7 @@ def train(train_loader, optimizer, model, origin_model, args, scheduler=None, wa
                         lr=current_lr,
                     )
                 )
+
 
 def nmse_loss(p, z):
     p_norm = p / (p.norm(dim=1, keepdim=True) + 1e-8)

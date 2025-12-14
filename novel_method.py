@@ -5,239 +5,221 @@ import torch.nn.functional as F
 import numpy as np
 
 
-class ChannelAligner(nn.Module):
-    """Learnable channel alignment for feature matching"""
-    def __init__(self, student_channels, teacher_channels):
-        super().__init__()
-        self.align = nn.Conv2d(student_channels, teacher_channels, 1, bias=False)
-        nn.init.kaiming_normal_(self.align.weight)
-        
-    def forward(self, x):
-        return self.align(x)
-
-
-class EnhancedMSFAMTrainer:
-    """Enhanced MSFAM trainer with progressive learning and adaptive weighting"""
+class ProgressiveBlockRecoveryTrainer:
+    """
+    Hybrid trainer combining:
+    1. Contrastive learning for feature alignment
+    2. Attention transfer for spatial/channel matching
+    3. Progressive unfreezing for multi-block pruning
+    4. Adaptive weighting based on training stage
+    """
     def __init__(self, student_model, teacher_model, rm_blocks=None, num_classes=1000, device='cuda'):
         self.student = student_model.to(device)
         self.teacher = teacher_model.to(device)
         self.device = device
         self.num_classes = num_classes
         self.rm_blocks = rm_blocks if rm_blocks else []
-
+        
+        # Parse block information for progressive unfreezing
+        self.block_layers = self._parse_blocks()
+        self.unfrozen_stages = 0
+        
         # Loss functions
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')
-        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         self.mse_loss = nn.MSELoss()
-
+        
         self.teacher.eval()
         
-        # Channel aligners (if needed)
-        self.channel_aligners = {}
+    def _parse_blocks(self):
+        """Parse removed blocks and sort by layer depth"""
+        blocks = []
+        for block in self.rm_blocks:
+            parts = block.split('.')
+            if len(parts) >= 2:
+                layer_num = int(parts[0].replace('layer', ''))
+                block_num = int(parts[1])
+                blocks.append((layer_num, block_num, block))
+        # Sort by layer (deep to shallow for progressive unfreezing)
+        blocks.sort(reverse=True)
+        return blocks
+    
+    def _progressive_unfreeze(self, epoch, total_epochs):
+        """Progressively unfreeze model parameters"""
+        if len(self.block_layers) == 0:
+            return
         
-        # Track training statistics
-        self.epoch_stats = {'easy_samples': 0, 'hard_samples': 0}
-
-    def get_sample_difficulty(self, teacher_logits):
-        """Estimate sample difficulty based on teacher confidence"""
-        probs = F.softmax(teacher_logits, dim=1)
-        max_probs, _ = torch.max(probs, dim=1)
-        # Lower confidence = harder sample
-        difficulty = 1.0 - max_probs
-        return difficulty
-
-    def curriculum_weight(self, difficulty, epoch, total_epochs):
-        """Progressive curriculum: start with easy samples, gradually add harder ones"""
-        progress = epoch / total_epochs
-        # Threshold increases from 0.3 to 1.0
-        threshold = 0.3 + 0.7 * progress
+        # Unfreeze in stages: 0-20% all frozen, then gradually unfreeze
+        num_stages = len(self.block_layers) + 1
+        stage_duration = total_epochs // num_stages
+        current_stage = min(epoch // stage_duration, num_stages - 1)
         
-        # Samples below threshold get full weight, above get reduced weight
-        weights = torch.where(
-            difficulty < threshold,
-            torch.ones_like(difficulty),
-            torch.exp(-3 * (difficulty - threshold))
-        )
-        return weights
-
-    def adaptive_loss_weights(self, epoch, total_epochs):
+        if current_stage > self.unfrozen_stages:
+            self.unfrozen_stages = current_stage
+            if current_stage > 0:
+                print(f"Epoch {epoch}: Unfreezing stage {current_stage}/{num_stages}")
+                # Unfreeze all parameters at current stage
+                for param in self.student.parameters():
+                    param.requires_grad = True
+    
+    def contrastive_loss(self, student_feat, teacher_feat, temperature=0.07):
+        """Contrastive loss for instance-level alignment"""
+        batch_size = student_feat.size(0)
+        
+        # Flatten and normalize
+        s_flat = F.normalize(student_feat.view(batch_size, -1), dim=1)
+        t_flat = F.normalize(teacher_feat.view(batch_size, -1), dim=1)
+        
+        # Similarity matrix
+        logits = torch.mm(s_flat, t_flat.t()) / temperature
+        labels = torch.arange(batch_size).to(self.device)
+        
+        return F.cross_entropy(logits, labels)
+    
+    def attention_transfer_loss(self, student_feat, teacher_feat):
+        """Spatial attention transfer"""
+        # Spatial attention maps
+        s_attention = torch.sum(student_feat.pow(2), dim=1, keepdim=True)
+        t_attention = torch.sum(teacher_feat.pow(2), dim=1, keepdim=True)
+        
+        # Normalize
+        bs = student_feat.size(0)
+        s_att_norm = F.normalize(s_attention.view(bs, -1), p=2, dim=1)
+        t_att_norm = F.normalize(t_attention.view(bs, -1), p=2, dim=1)
+        
+        return F.mse_loss(s_att_norm, t_att_norm)
+    
+    def relation_loss(self, student_feat, teacher_feat):
+        """Pairwise relation preservation"""
+        bs = student_feat.size(0)
+        s_flat = F.normalize(student_feat.view(bs, -1), p=2, dim=1)
+        t_flat = F.normalize(teacher_feat.view(bs, -1), p=2, dim=1)
+        
+        # Pairwise similarity
+        s_sim = torch.mm(s_flat, s_flat.t())
+        t_sim = torch.mm(t_flat, t_flat.t())
+        
+        return F.mse_loss(s_sim, t_sim)
+    
+    def get_loss_weights(self, epoch, total_epochs):
         """Adaptive loss weights based on training progress"""
         progress = epoch / total_epochs
         
         if progress < 0.2:
-            # Early: focus on feature matching
+            # Early: Focus on feature matching and contrastive
             lambda_ce = 0.1
             lambda_kd = 0.3
-            lambda_feat = 0.4
-            lambda_channel = 0.2
+            lambda_contrast = 0.3
+            lambda_attention = 0.2
+            lambda_relation = 0.1
         elif progress < 0.5:
-            # Mid-early: balanced
+            # Mid-early: Balance all losses
             lambda_ce = 0.15
             lambda_kd = 0.35
-            lambda_feat = 0.35
-            lambda_channel = 0.15
+            lambda_contrast = 0.25
+            lambda_attention = 0.15
+            lambda_relation = 0.1
         elif progress < 0.8:
-            # Mid-late: emphasize KD
+            # Mid-late: Emphasize KD and classification
             lambda_ce = 0.2
-            lambda_kd = 0.45
-            lambda_feat = 0.25
-            lambda_channel = 0.1
+            lambda_kd = 0.4
+            lambda_contrast = 0.2
+            lambda_attention = 0.1
+            lambda_relation = 0.1
         else:
-            # Late: focus on classification and KD
+            # Late: Focus on classification
             lambda_ce = 0.25
-            lambda_kd = 0.5
-            lambda_feat = 0.2
-            lambda_channel = 0.05
-            
-        return lambda_ce, lambda_kd, lambda_feat, lambda_channel
-
-    def multi_scale_feature_loss(self, student_feat, teacher_feat):
-        """Multi-scale feature alignment with spatial attention"""
-        bs, c, h, w = student_feat.shape
+            lambda_kd = 0.45
+            lambda_contrast = 0.15
+            lambda_attention = 0.1
+            lambda_relation = 0.05
         
-        # 1. Global feature alignment
-        global_loss = self.mse_loss(student_feat, teacher_feat)
-        
-        # 2. Spatial attention alignment
-        s_spatial = student_feat.pow(2).mean(1, keepdim=True)  # [B, 1, H, W]
-        t_spatial = teacher_feat.pow(2).mean(1, keepdim=True)
-        
-        s_spatial_norm = F.normalize(s_spatial.view(bs, -1), dim=1)
-        t_spatial_norm = F.normalize(t_spatial.view(bs, -1), dim=1)
-        spatial_loss = self.mse_loss(s_spatial_norm, t_spatial_norm)
-        
-        # 3. Channel-wise correlation
-        s_channel = student_feat.view(bs, c, -1).mean(2)  # [B, C]
-        t_channel = teacher_feat.view(bs, c, -1).mean(2)
-        
-        s_channel_norm = F.normalize(s_channel, dim=1)
-        t_channel_norm = F.normalize(t_channel, dim=1)
-        channel_loss = self.mse_loss(s_channel_norm, t_channel_norm)
-        
-        return global_loss + 0.5 * spatial_loss + 0.5 * channel_loss
-
-    def instance_level_loss(self, student_feat, teacher_feat):
-        """Instance-level normalized MSE loss"""
-        bs = student_feat.size(0)
-        s_feat_flat = student_feat.view(bs, -1)
-        t_feat_flat = teacher_feat.view(bs, -1)
-        
-        s_norm = s_feat_flat / (s_feat_flat.norm(dim=1, keepdim=True) + 1e-8)
-        t_norm = t_feat_flat / (t_feat_flat.norm(dim=1, keepdim=True) + 1e-8)
-        
-        return torch.mean((s_norm - t_norm) ** 2)
-
-    def class_level_loss(self, student_feat, teacher_feat):
-        """Class-level feature distribution matching"""
-        bs = student_feat.size(0)
-        s_feat_flat = student_feat.view(bs, -1)
-        t_feat_flat = teacher_feat.view(bs, -1)
-        
-        # Transpose to get [C, B] and apply normalization
-        s_class = s_feat_flat.t()
-        t_class = t_feat_flat.t()
-        
-        s_class_norm = s_class / (s_class.norm(dim=1, keepdim=True) + 1e-8)
-        t_class_norm = t_class / (t_class.norm(dim=1, keepdim=True) + 1e-8)
-        
-        return torch.mean((s_class_norm - t_class_norm) ** 2)
-
-    def train_step(self, images, labels, optimizer, epoch, total_epochs, accumulation_steps=2):
-        """Enhanced training step with all improvements"""
+        return lambda_ce, lambda_kd, lambda_contrast, lambda_attention, lambda_relation
+    
+    def train_step(self, images, labels, optimizer, epoch, total_epochs):
+        """Training step with hybrid losses"""
         self.student.train()
-
+        
         images = images.to(self.device)
         labels = labels.to(self.device)
-
-        # Set feature extraction mode
+        
+        # Progressive unfreezing
+        self._progressive_unfreeze(epoch, total_epochs)
+        
+        # Set feature extraction
         self.student.get_feat = 'pre_GAP'
         self.teacher.get_feat = 'pre_GAP'
-
-        # Get teacher outputs (no grad)
+        
+        # Forward pass
         with torch.no_grad():
             teacher_logits, teacher_feat = self.teacher(images)
-            
-            # Estimate sample difficulty
-            difficulty = self.get_sample_difficulty(teacher_logits)
-            curriculum_weights = self.curriculum_weight(difficulty, epoch, total_epochs)
-
-        # Get student outputs
+        
         student_logits, student_feat = self.student(images)
-
-        # Get adaptive loss weights
-        lambda_ce, lambda_kd, lambda_feat, lambda_channel = self.adaptive_loss_weights(epoch, total_epochs)
-
-        # 1. Classification loss (weighted by curriculum)
-        if len(labels.shape) == 1:
-            ce_loss_per_sample = F.cross_entropy(student_logits, labels, reduction='none', label_smoothing=0.1)
-            ce_loss = (ce_loss_per_sample * curriculum_weights).mean()
-        else:
-            ce_loss_per_sample = -torch.sum(labels * F.log_softmax(student_logits, dim=1), dim=1)
-            ce_loss = (ce_loss_per_sample * curriculum_weights).mean()
-
-        # 2. KD loss with adaptive temperature
-        base_temp = 4.0
-        progress = epoch / total_epochs
-        temperature = base_temp * (1.0 - 0.4 * progress)  # Gradually decrease temperature
-
-        soft_student = F.log_softmax(student_logits / temperature, dim=1)
-        soft_teacher = F.softmax(teacher_logits / temperature, dim=1)
         
-        kd_loss_per_sample = F.kl_div(soft_student, soft_teacher, reduction='none').sum(dim=1)
-        kd_loss = (kd_loss_per_sample * curriculum_weights).mean() * (temperature ** 2)
-
-        # 3. Multi-scale feature matching loss
-        feat_loss = self.multi_scale_feature_loss(student_feat, teacher_feat)
-
-        # 4. Instance and class level losses
-        inst_loss = self.instance_level_loss(student_feat, teacher_feat)
-        class_loss = self.class_level_loss(student_feat, teacher_feat)
+        # Get adaptive weights
+        lambda_ce, lambda_kd, lambda_contrast, lambda_attention, lambda_relation = \
+            self.get_loss_weights(epoch, total_epochs)
         
-        channel_loss = inst_loss + class_loss
-
-        # Combined loss with gradient accumulation scaling
+        # 1. Classification loss
+        ce_loss = self.ce_loss(student_logits, labels).mean()
+        
+        # 2. Knowledge Distillation loss
+        temperature = 4.0
+        kd_loss = self.kl_loss(
+            F.log_softmax(student_logits / temperature, dim=1),
+            F.softmax(teacher_logits / temperature, dim=1)
+        ) * (temperature ** 2)
+        
+        # 3. Contrastive loss (proven effective)
+        contrast_loss = self.contrastive_loss(student_feat, teacher_feat, temperature=0.07)
+        
+        # 4. Attention transfer (proven effective)
+        attention_loss = self.attention_transfer_loss(student_feat, teacher_feat)
+        
+        # 5. Relation loss
+        relation_loss = self.relation_loss(student_feat, teacher_feat)
+        
+        # Combined loss
         total_loss = (
             lambda_ce * ce_loss +
             lambda_kd * kd_loss +
-            lambda_feat * feat_loss +
-            lambda_channel * channel_loss
-        ) / accumulation_steps
-
-        # Backward
+            lambda_contrast * contrast_loss +
+            lambda_attention * attention_loss +
+            lambda_relation * relation_loss
+        )
+        
         total_loss.backward()
-
-        # Return scaled losses for logging
+        
         return {
-            'total_loss': total_loss.item() * accumulation_steps,
+            'total_loss': total_loss.item(),
             'ce_loss': ce_loss.item(),
             'kd_loss': kd_loss.item(),
-            'feat_loss': feat_loss.item(),
-            'channel_loss': channel_loss.item(),
-            'avg_difficulty': difficulty.mean().item(),
-            'temperature': temperature
+            'contrast_loss': contrast_loss.item(),
+            'attention_loss': attention_loss.item(),
+            'relation_loss': relation_loss.item(),
         }
-
+    
     def cleanup(self):
         """Cleanup resources"""
-        self.channel_aligners.clear()
         torch.cuda.empty_cache()
 
 
 # Backward compatibility
-SimplifiedMSFAMTrainer = EnhancedMSFAMTrainer
-MSFAMTrainer = EnhancedMSFAMTrainer
+SimplifiedMSFAMTrainer = ProgressiveBlockRecoveryTrainer
+EnhancedMSFAMTrainer = ProgressiveBlockRecoveryTrainer
+MSFAMTrainer = ProgressiveBlockRecoveryTrainer
 
 
 def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr=0.01, num_classes=1000, rm_blocks=None):
-    """Train student model using Enhanced MSFAM method"""
+    """Train student model using Progressive Block Recovery method"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    trainer = EnhancedMSFAMTrainer(
-        student_model, teacher_model, 
+    
+    trainer = ProgressiveBlockRecoveryTrainer(
+        student_model, teacher_model,
         rm_blocks=rm_blocks, num_classes=num_classes, device=device
     )
-
-    # Optimizer with Nesterov momentum
+    
+    # Optimizer with proper hyperparameters
     optimizer = torch.optim.SGD(
         filter(lambda p: p.requires_grad, student_model.parameters()),
         lr=lr,
@@ -245,71 +227,69 @@ def train_with_msfam(student_model, teacher_model, train_loader, epochs=2000, lr
         weight_decay=1e-4,
         nesterov=True
     )
-
+    
     # Cosine annealing with warmup
     warmup_epochs = int(0.1 * epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
     )
-
-    # Gradient accumulation
+    
+    # Gradient accumulation for stability
     accumulation_steps = 2
-
+    
     for epoch in range(epochs):
         epoch_losses = {
             'total_loss': 0,
             'ce_loss': 0,
             'kd_loss': 0,
-            'feat_loss': 0,
-            'channel_loss': 0,
-            'avg_difficulty': 0,
+            'contrast_loss': 0,
+            'attention_loss': 0,
+            'relation_loss': 0,
         }
-
+        
         for batch_idx, (images, labels) in enumerate(train_loader):
             # Warmup learning rate
             if epoch < warmup_epochs:
                 lr_scale = (epoch * len(train_loader) + batch_idx + 1) / (warmup_epochs * len(train_loader))
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr * lr_scale
-
-            losses = trainer.train_step(
-                images, labels, optimizer, epoch, epochs, accumulation_steps
-            )
-
+            
+            losses = trainer.train_step(images, labels, optimizer, epoch, epochs)
+            
             # Accumulate losses
             for key in epoch_losses:
                 if key in losses:
                     epoch_losses[key] += losses[key]
-
-            # Step optimizer every accumulation_steps
+            
+            # Step optimizer with gradient accumulation
             if (batch_idx + 1) % accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(
-                    filter(lambda p: p.requires_grad, student_model.parameters()), 
+                    filter(lambda p: p.requires_grad, student_model.parameters()),
                     max_norm=5.0
                 )
                 optimizer.step()
                 optimizer.zero_grad()
-
+            
             # Clear cache periodically
             if batch_idx % 20 == 0:
                 torch.cuda.empty_cache()
-
+        
         # Step scheduler after warmup
         if epoch >= warmup_epochs:
             scheduler.step()
-
+        
         # Calculate epoch averages
         for key in epoch_losses:
             epoch_losses[key] /= len(train_loader)
-
+        
         # Print epoch statistics
         if (epoch + 1) % 50 == 0:
             print(f"\nEpoch {epoch+1}/{epochs}")
-            print(f"  Total: {epoch_losses['total_loss']:.4f} | CE: {epoch_losses['ce_loss']:.4f} | "
-                  f"KD: {epoch_losses['kd_loss']:.4f} | Feature: {epoch_losses['feat_loss']:.4f}")
-            print(f"  Channel: {epoch_losses['channel_loss']:.4f} | Difficulty: {epoch_losses['avg_difficulty']:.4f}")
+            print(f"  Total: {epoch_losses['total_loss']:.4f} | CE: {epoch_losses['ce_loss']:.4f}")
+            print(f"  KD: {epoch_losses['kd_loss']:.4f} | Contrast: {epoch_losses['contrast_loss']:.4f}")
+            print(f"  Attention: {epoch_losses['attention_loss']:.4f} | Relation: {epoch_losses['relation_loss']:.4f}")
             print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
-
+    
     trainer.cleanup()
     return student_model
 

@@ -423,11 +423,11 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
 
     # Select training method based on args
     if hasattr(args, 'use_msfam') and args.use_msfam:
-        print("Using Enhanced MSFAM method (Multi-Scale Feature Alignment with Adaptive Mixup)")
-        from novel_method import SimplifiedMSFAMTrainer
+        print("Using Progressive Block Recovery (Hybrid: Contrastive + Attention + Adaptive KD)")
+        from novel_method import ProgressiveBlockRecoveryTrainer
 
         # Create trainer with rm_blocks info
-        trainer = SimplifiedMSFAMTrainer(prune_model, origin_model, rm_blocks=rm_blocks, num_classes=args.num_classes)
+        trainer = ProgressiveBlockRecoveryTrainer(prune_model, origin_model, rm_blocks=rm_blocks, num_classes=args.num_classes)
 
         # Training loop
         iter_nums = 0
@@ -450,10 +450,11 @@ def Practise_recover(train_loader, origin_model, prune_model, rm_blocks, args):
 
                 if iter_nums % 50 == 0:
                     print(f"Train: [{iter_nums}/{args.epoch}]\t"
-                          f"Total Loss {losses['total_loss']:.4f}\t"
-                          f"CE Loss {losses['ce_loss']:.4f}\t"
-                          f"KD Loss {losses['kd_loss']:.4f}\t"
-                          f"Feature Loss {losses['feat_loss']:.4f}")
+                          f"Total: {losses['total_loss']:.4f}\t"
+                          f"CE: {losses['ce_loss']:.4f}\t"
+                          f"KD: {losses['kd_loss']:.4f}\t"
+                          f"Contrast: {losses['contrast_loss']:.4f}\t"
+                          f"Attention: {losses['attention_loss']:.4f}")
 
         trainer.cleanup()
     elif hasattr(args, 'training_method'):

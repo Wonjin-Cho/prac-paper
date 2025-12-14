@@ -180,16 +180,16 @@ def main():
     # python main.py --num_sample 500 --seed 2021 --epoch 100 --practise one --rm_blocks layer1.1 --gpu_id 0
     args.num_sample = 1280
     args.seed = 2021
-    args.epoch = 2000  # Significantly increased for 3-block pruning
+    args.epoch = 2000  # Training epochs for 3-block pruning
     args.state_dict_path = ""
-    args.lr = 0.02  # Restore higher initial LR for faster initial learning
+    args.lr = 0.015  # Slightly lower LR for stability with hybrid method
     args.practise = "all"
     args.rm_blocks = "1"
     args.gpu_id = "0"
     args.dataset = "fakenet"
-    args.batch_size = 64  # Ensure consistent batch size
-    args.use_msfam = True  # Set to True to use enhanced MSFAM novel training method with progressive learning
-    args.training_method = 'clkd'  # Options: 'clkd', 'mmd', 'attention', 'contrastive', or set use_msfam=True (recommended)
+    args.batch_size = 64
+    args.use_msfam = True  # Use Progressive Block Recovery (Hybrid method)
+    args.training_method = 'hybrid'  # Hybrid: contrastive + attention + adaptive KD
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
